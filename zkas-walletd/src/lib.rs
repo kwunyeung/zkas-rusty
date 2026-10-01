@@ -46,10 +46,14 @@ use std::sync::Arc;
 
 pub mod selfhost;
 pub use selfhost::{SelfHostConfig, run_selfhost};
+mod batch_prepare;
+use batch_prepare::BatchRegistry;
+#[cfg(test)]
+use batch_prepare::{BatchGrantReq, BatchStart, choose_batch_spends, parse_batch_intent};
 
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
@@ -82,7 +86,7 @@ use zkas_sdk::{
     SpendAuthRequest as SdkSpendAuthRequest,
 };
 use zkas_wallet_engine::{
-    DEFAULT_FEE_SOMPI, chunk_fee, max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, plan_payment,
+    DEFAULT_FEE_SOMPI, chunk_fee, max_actions_per_tx, max_payees_per_tx, max_spends_per_tx, min_relay_fee_for_actions, plan_payment,
     select_spend_count as engine_select_spend_count,
 };
 
@@ -221,6 +225,103 @@ const WARM_OVERLAP_MAX_BEHIND: u64 = 50_000;
 /// otherwise hand the bypass to every wallet that had never seen a tip.
 fn warm_overlap_allowed(warm_priority: bool, chain_len: u64, scanned: u64) -> bool {
     warm_priority && chain_len > 0 && chain_len.saturating_sub(scanned) <= WARM_OVERLAP_MAX_BEHIND
+}
+
+#[cfg(test)]
+mod batch_prepare_contract_tests {
+    use super::*;
+
+    #[test]
+    fn exact_batch_intent_keeps_every_memo_byte_and_rejects_duplicate_recipient() {
+        let account = address_bytes_from_seed([7; 32]).unwrap();
+        let recipient = address_bytes_from_seed([8; 32]).unwrap();
+        let address = String::from(&Address::new(prefix_from("mainnet"), Version::ShieldedOrchard, &recipient));
+        let account_text = String::from(&Address::new(prefix_from("mainnet"), Version::ShieldedOrchard, &account));
+        let mut memo = [0u8; 512];
+        memo[0] = 1;
+        memo[511] = 255;
+        let mut req: BatchGrantReq = serde_json::from_value(serde_json::json!({
+            "origin": "https://example.test",
+            "account": account_text,
+            "genesis": hex(&[9; 32]),
+            "logicalId": hex(&[4; 32]),
+            "outputs": [{"recipient": address, "amountSompi": "1", "memoHex": hex(&memo)}],
+            "maxFeeSompi": "3000000"
+        })).unwrap();
+        let intent = parse_batch_intent(&req, account, [9; 32], prefix_from("mainnet")).unwrap();
+        assert_eq!(intent.outputs[0].memo, memo);
+        req.outputs.push(req.outputs[0].clone());
+        assert!(parse_batch_intent(&req, account, [9; 32], prefix_from("mainnet")).is_err());
+        req.outputs.pop();
+        req.origin = "https://:443".into();
+        assert!(parse_batch_intent(&req, account, [9; 32], prefix_from("mainnet")).is_err());
+        req.origin = "https://example.test".into();
+        req.outputs[0].memo_hex = "0".repeat(1023);
+        assert!(parse_batch_intent(&req, account, [9; 32], prefix_from("mainnet")).is_err());
+        req.outputs[0].memo_hex = format!("A{}", "0".repeat(1023));
+        assert!(parse_batch_intent(&req, account, [9; 32], prefix_from("mainnet")).is_err());
+        req.outputs[0].memo_hex = hex(&memo);
+        req.outputs[0].amount_sompi = "+1".into();
+        assert!(parse_batch_intent(&req, account, [9; 32], prefix_from("mainnet")).is_err());
+        assert!(serde_json::from_value::<BatchGrantReq>(serde_json::json!({
+            "origin": "https://example.test", "account": account_text,
+            "genesis": hex(&[9; 32]), "logicalId": hex(&[4; 32]),
+            "outputs": [], "maxFeeSompi": "3000000", "plaintext": "must be rejected"
+        })).is_err());
+        assert!(serde_json::from_value::<BatchGrantReq>(serde_json::json!({
+            "origin": "https://example.test", "account": account_text,
+            "genesis": hex(&[9; 32]), "logicalId": hex(&[4; 32]),
+            "outputs": vec![serde_json::json!({"recipient":"", "amountSompi":"", "memoHex":""}); max_payees_per_tx() + 1],
+            "maxFeeSompi": "3000000"
+        })).is_err());
+    }
+
+    #[test]
+    fn same_logical_intent_reuses_one_capability_and_foreign_intent_cannot_overlap() {
+        let account = address_bytes_from_seed([7; 32]).unwrap();
+        let recipient = address_bytes_from_seed([8; 32]).unwrap();
+        let mut registry = BatchRegistry::default();
+        let intent = zkas_sdk::BatchIntent {
+            account,
+            outputs: vec![kaspa_shielded_core::payment_check::PaymentOutputIntent { recipient, amount: 1, memo: [0; 512] }],
+            max_fee: 3_000_000,
+        };
+        let fvk = [4; 96];
+        let now = std::time::Instant::now();
+        let first = registry.issue(fvk, "wallet", "https://example.test", [5; 32], intent.clone(), now).unwrap();
+        assert_eq!(registry.issue(fvk, "wallet", "https://example.test", [5; 32], intent.clone(), now).unwrap(), first);
+        assert!(registry.reserves(&fvk, now));
+        assert!(registry.issue(fvk, "wallet", "https://example.test", [6; 32], intent.clone(), now).is_err());
+        let mut changed = intent.clone();
+        changed.outputs[0].memo[0] = 1;
+        assert!(registry.issue(fvk, "wallet", "https://example.test", [5; 32], changed, now).is_err());
+        assert!(registry.authorize(&first, "https://example.test", now).is_ok());
+        assert!(registry.authorize(&first, "https://other.test", now).is_err());
+        assert!(registry.authorize(&first, "https://example.test", now + std::time::Duration::from_secs(901)).is_err());
+        assert!(matches!(registry.start(&first, "https://example.test", now), Ok(BatchStart::New(_))));
+        assert!(matches!(registry.start(&first, "https://example.test", now), Ok(BatchStart::InProgress)));
+        assert!(registry.reserves(&fvk, now + std::time::Duration::from_secs(901)));
+        assert!(registry.authorize(&first, "https://example.test", now + std::time::Duration::from_secs(901)).is_err());
+        registry.finish_failure(&fvk, now + std::time::Duration::from_secs(902));
+        assert!(registry.reserves(&fvk, now + std::time::Duration::from_secs(903)));
+        assert!(registry.issue(fvk, "wallet", "https://example.test", [5; 32], intent, now + std::time::Duration::from_secs(903)).is_err());
+    }
+
+    #[test]
+    fn capability_authorization_is_limited_to_the_prepare_route() {
+        assert!(is_cap_only_prepare(&Method::POST, "/api/wallet/prepare-many"));
+        assert!(!is_cap_only_prepare(&Method::GET, "/api/wallet/prepare-many"));
+        assert!(!is_cap_only_prepare(&Method::POST, "/api/wallet/submit"));
+        assert!(!is_cap_only_prepare(&Method::POST, "/api/wallet/prepare-many/capability"));
+    }
+
+    #[test]
+    fn batch_selection_accounts_for_more_spends_and_positive_change() {
+        let (count, fee) = choose_batch_spends(&[900_000; 6], 1_000_000, 2, 5_000_000).unwrap();
+        assert_eq!(count, 6);
+        assert!(fee >= min_relay_fee_for_actions(6));
+        assert!(choose_batch_spends(&[900_000; 6], 1_000_000, 2, 1_000_000).is_err());
+    }
 }
 
 /// How recently a request must have touched a wallet for it to count as WATCHED —
@@ -4289,6 +4390,8 @@ struct AppState {
     /// signatures, and broadcasts. Held in memory only — a restart drops pending
     /// sessions (the device just re-prepares). The seed is never involved.
     prepared: Mutex<HashMap<String, PreparedSession>>,
+    /// At most one unresolved multi-output intent per decoded viewing key.
+    batch_preparations: std::sync::Mutex<BatchRegistry>,
     /// Last-known-good status per loaded wallet, read by `status` when the wallet mutex
     /// is momentarily held by the sync loop (see [`StatusSnap`]). Refreshed by the sync
     /// loop each pass and by any `status` call that acquires the wallet lock.
@@ -4570,6 +4673,7 @@ struct StatusSnap {
 /// A non-custodial payment proven and awaiting on-device spend-auth signatures.
 struct PreparedSession {
     payment: PreparedPayment,
+    fvk: [u8; FVK_LEN],
     amount: u64,
     fee: u64,
     created: std::time::Instant,
@@ -5987,6 +6091,11 @@ async fn mempool_loop(state: Arc<AppState>) {
 /// lets the fast-sync base roll forward past the spent notes, shortening every later
 /// witness rebuild.
 async fn consolidate_loop(state: Arc<AppState>) {
+    // Seed-backed maintenance is outside the non-custodial daemon profile,
+    // including seed wallets left on disk before that profile was selected.
+    if !state.allow_custodial {
+        return;
+    }
     let Some(ceiling) = state.auto_consolidate else { return };
     log::info!(
         "auto-consolidate: ON — custodial wallets are kept under {ceiling} notes \
@@ -9268,8 +9377,13 @@ async fn wallet_prepare(
                 },
             ));
         }
+        if state.batch_preparations.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "batch tracker poisoned"))?
+            .reserves(&fvk_bytes, std::time::Instant::now())
+        {
+            return Err(err(StatusCode::CONFLICT, "this wallet already has an unresolved multi-output preparation"));
+        }
         set.insert(guard_key.clone(), (std::time::Instant::now(), self_payment));
-        PreparingGuard { state: state.clone(), key: req.fvk_hex.clone() }
+        PreparingGuard { state: state.clone(), key: guard_key }
     };
 
     let requested = match (req.amount_sompi, req.amount_fc) {
@@ -9713,7 +9827,7 @@ let client = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL); // bound memory
         map.insert(
             session.clone(),
-            PreparedSession { payment, amount, fee, created: now, token: session_token, positions: spent_positions },
+            PreparedSession { payment, fvk: fvk_bytes, amount, fee, created: now, token: session_token, positions: spent_positions },
         );
     }
 
@@ -9996,11 +10110,23 @@ async fn bearer_guard(State(expected): State<std::sync::Arc<String>>, req: Reque
     if req.method() == Method::OPTIONS || req.uri().path() == "/health" {
         return next.run(req).await;
     }
+    if is_cap_only_prepare(req.method(), req.uri().path())
+        && req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Batch "))
+            .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        // This route validates the capability and Origin before any wallet work.
+        return next.run(req).await;
+    }
     let presented = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|s| s.strip_prefix("Bearer "));
     match presented {
         Some(tok) if ct_eq(tok.as_bytes(), expected.as_bytes()) => next.run(req).await,
         _ => (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response(),
     }
+}
+
+fn is_cap_only_prepare(method: &Method, path: &str) -> bool {
+    *method == Method::POST && path == "/api/wallet/prepare-many"
 }
 
 /// Longest a single `warm_chain_tree` call drives the shared tree before returning, so a
@@ -11123,6 +11249,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         warm_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(resources.warm_wallets.max(1))),
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
+        batch_preparations: std::sync::Mutex::new(BatchRegistry::default()),
         snapshots: Mutex::new(HashMap::new()),
         addr_index: Mutex::new(HashMap::new()),
         in_pass: std::sync::Mutex::new(HashSet::new()),
@@ -11311,6 +11438,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/send_many", post(wallet_send_many))
         .route("/api/wallet/consolidate", post(wallet_consolidate))
         .route("/api/wallet/prepare", post(wallet_prepare))
+        .route("/api/wallet/prepare-many/capability", post(batch_prepare::issue_batch_capability).layer(DefaultBodyLimit::max(64 * 1024)))
+        .route("/api/wallet/prepare-many", post(batch_prepare::prepare_many).get(batch_prepare::prepared_many).layer(DefaultBodyLimit::max(0)))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
