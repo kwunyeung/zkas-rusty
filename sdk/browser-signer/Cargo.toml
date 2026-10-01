@@ -1,0 +1,36 @@
+[package]
+name = "zkas-browser-signer"
+description = "Wallet-private browser binding for approved ZKas shielded payments"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lints]
+workspace = true
+
+[dependencies]
+zkas-sdk.workspace = true
+zkas-signer.workspace = true
+zkas-wallet-engine.workspace = true
+kaspa-shielded-core.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+hex.workspace = true
+wasm-bindgen.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "=0.4.2", features = ["wasm_js"] }
+
+[dev-dependencies]
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
+orchard = { package = "zakura-orchard", version = "=1.0.1", default-features = false, features = ["std", "weighted-merkle"] }

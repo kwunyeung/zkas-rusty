@@ -25,6 +25,7 @@ members = [
     "shielded-wallet",
     "sdk/wallet-engine",
     "sdk/signer",
+    "sdk/browser-signer",
     "sdk/core",
     "gateway/core",
     "gateway/service",

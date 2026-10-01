@@ -2652,11 +2652,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if 1.0.0",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -9958,6 +9960,24 @@ dependencies = [
  "tonic",
  "tower-http",
  "uuid",
+]
+
+[[package]]
+name = "zkas-browser-signer"
+version = "2.0.1"
+dependencies = [
+ "getrandom 0.4.2",
+ "hex",
+ "incrementalmerkletree",
+ "kaspa-shielded-core",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "zakura-orchard",
+ "zeroize",
+ "zkas-sdk",
+ "zkas-signer",
+ "zkas-wallet-engine",
 ]
 
 [[package]]
