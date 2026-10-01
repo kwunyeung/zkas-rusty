@@ -8,13 +8,25 @@
 //! bundle, that the payment really is the one the user asked for, using only note and
 //! value commitments — no proving circuit, so it is available to a WASM light wallet.
 
+use crate::bundle::MAX_ACTIONS_PER_BUNDLE;
 use crate::bundle::ShieldedBundle;
 use orchard::{
     Address,
     keys::{FullViewingKey, Scope},
     note::{ExtractedNoteCommitment, Note},
+    note_encryption::{OrchardDomain, OrchardNoteEncryption},
     value::NoteValue,
 };
+use zcash_note_encryption::Domain;
+
+/// One exact, independently approved Orchard V2 recipient output. The memo is
+/// already padded to the 512 bytes encrypted into the recipient note.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PaymentOutputIntent {
+    pub recipient: [u8; 43],
+    pub amount: u64,
+    pub memo: [u8; 512],
+}
 
 /// What the prover must disclose about one action so the device can check the
 /// payment **before** signing it. Every field is already in the PCZT the prover
@@ -46,6 +58,12 @@ pub struct ActionDisclosure {
 /// buggy or malicious daemon — and the device must not sign.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PaymentCheckError {
+    /// Empty, oversized, duplicate, malformed, wallet-owned, or out-of-range intent.
+    InvalidIntent,
+    /// A payment output or its approved memo differs from the encrypted wire bytes.
+    CiphertextMismatch(usize),
+    /// An approved output is absent or an unapproved positive output is present.
+    OutputMismatch(usize),
     /// Disclosure does not cover every action in the bundle.
     ActionCountMismatch,
     /// An action's output note commitment does not match the disclosed
@@ -73,6 +91,9 @@ pub enum PaymentCheckError {
 impl core::fmt::Display for PaymentCheckError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::InvalidIntent => write!(f, "invalid prepared payment intent set"),
+            Self::CiphertextMismatch(i) => write!(f, "action {i}: recipient ciphertext or ephemeral key differs from approval"),
+            Self::OutputMismatch(i) => write!(f, "action {i}: payment output differs from approval"),
             Self::ActionCountMismatch => write!(f, "prover disclosed the wrong number of actions"),
             Self::CommitmentMismatch(i) => write!(f, "action {i}: the note it creates is not the one disclosed"),
             Self::ValueCommitmentMismatch(i) => write!(f, "action {i}: value commitment does not match the disclosed amounts"),
@@ -86,6 +107,105 @@ impl core::fmt::Display for PaymentCheckError {
             Self::Malformed(i) => write!(f, "action {i}: disclosed note fields are not valid"),
         }
     }
+}
+
+/// Check a bounded set of distinct approved payments against one Orchard V2
+/// bundle. This does not sign, prove, authorize inputs, or validate a transaction
+/// network/context/sighash; those remain duties of the caller's higher layer.
+/// `fee` is the actual approved fee and `max_fee` is its ceiling.
+pub fn check_prepared_payment_multi(
+    wire: &ShieldedBundle,
+    disclosure: &[ActionDisclosure],
+    fvk: &FullViewingKey,
+    intents: &[PaymentOutputIntent],
+    fee: u64,
+    max_fee: u64,
+) -> Result<(), PaymentCheckError> {
+    use orchard::{
+        note::{RandomSeed, Rho},
+        value::{ValueCommitTrapdoor, ValueCommitment},
+    };
+
+    if intents.is_empty() || intents.len() > MAX_ACTIONS_PER_BUNDLE || wire.actions.len() > MAX_ACTIONS_PER_BUNDLE {
+        return Err(PaymentCheckError::InvalidIntent);
+    }
+    if disclosure.len() != wire.actions.len() {
+        return Err(PaymentCheckError::ActionCountMismatch);
+    }
+    let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+    let mut approved_total = 0u64;
+    for (i, intent) in intents.iter().enumerate() {
+        if intent.amount == 0
+            || intent.amount > i64::MAX as u64
+            || intent.recipient == mine
+            || intents[..i].iter().any(|other| other.recipient == intent.recipient)
+            || !matches!(Option::<Address>::from(Address::from_raw_address_bytes(&intent.recipient)), Some(address) if address.to_raw_address_bytes() == intent.recipient)
+        {
+            return Err(PaymentCheckError::InvalidIntent);
+        }
+        approved_total = approved_total.checked_add(intent.amount).ok_or(PaymentCheckError::InvalidIntent)?;
+    }
+    if approved_total.checked_add(fee).is_none_or(|total| total > i64::MAX as u64) || fee > max_fee || i64::try_from(fee).is_err() {
+        return Err(PaymentCheckError::InvalidIntent);
+    }
+
+    let mut matched = vec![false; intents.len()];
+    let (mut spent_total, mut out_total) = (0i128, 0i128);
+    for (i, (act, d)) in wire.actions.iter().zip(disclosure).enumerate() {
+        let rho = Option::<Rho>::from(Rho::from_bytes(&act.nullifier)).ok_or(PaymentCheckError::Malformed(i))?;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(d.out_rseed, &rho)).ok_or(PaymentCheckError::Malformed(i))?;
+        let recipient =
+            Option::<Address>::from(Address::from_raw_address_bytes(&d.out_recipient)).ok_or(PaymentCheckError::Malformed(i))?;
+        let out_value = NoteValue::from_raw(d.out_value);
+        let note = Option::<Note>::from(Note::from_parts(recipient, out_value, rho, rseed, orchard::note::NoteVersion::V2))
+            .ok_or(PaymentCheckError::Malformed(i))?;
+        if ExtractedNoteCommitment::from(note.commitment()).to_bytes() != act.cmx {
+            return Err(PaymentCheckError::CommitmentMismatch(i));
+        }
+        let rcv =
+            Option::<ValueCommitTrapdoor>::from(ValueCommitTrapdoor::from_bytes(d.rcv)).ok_or(PaymentCheckError::Malformed(i))?;
+        let spend_value = NoteValue::from_raw(d.spend_value);
+        if ValueCommitment::derive(spend_value - out_value, rcv).to_bytes() != act.cv_net {
+            return Err(PaymentCheckError::ValueCommitmentMismatch(i));
+        }
+
+        if d.out_value != 0 {
+            let (memo, payment_index) = if d.out_recipient == mine {
+                ([0u8; 512], None)
+            } else {
+                let Some((index, intent)) =
+                    intents.iter().enumerate().find(|(_, intent)| intent.recipient == d.out_recipient && intent.amount == d.out_value)
+                else {
+                    return Err(PaymentCheckError::OutputMismatch(i));
+                };
+                if matched[index] {
+                    return Err(PaymentCheckError::OutputMismatch(i));
+                }
+                (intent.memo, Some(index))
+            };
+            let encryption = OrchardNoteEncryption::new(None, note, memo);
+            if OrchardDomain::epk_bytes(encryption.epk()).0 != act.ephemeral_key
+                || encryption.encrypt_note_plaintext() != act.enc_ciphertext
+            {
+                return Err(PaymentCheckError::CiphertextMismatch(i));
+            }
+            if let Some(index) = payment_index {
+                matched[index] = true;
+            }
+        }
+        spent_total += i128::from(d.spend_value);
+        out_total += i128::from(d.out_value);
+    }
+    if matched.iter().any(|found| !found) {
+        return Err(PaymentCheckError::RecipientNotPaid);
+    }
+    if spent_total - out_total != i128::from(wire.value_balance) {
+        return Err(PaymentCheckError::ValueImbalance);
+    }
+    if wire.value_balance != fee as i64 {
+        return Err(PaymentCheckError::FeeMismatch { got: wire.value_balance, want: fee });
+    }
+    Ok(())
 }
 
 /// **The device's guard against a malicious prover.** Verifies that `wire` — the
@@ -140,7 +260,8 @@ pub fn check_prepared_payment(
         let recipient =
             Option::<Address>::from(Address::from_raw_address_bytes(&d.out_recipient)).ok_or(PaymentCheckError::Malformed(i))?;
         let out_value = NoteValue::from_raw(d.out_value);
-        let note = Option::<Note>::from(Note::from_parts(recipient, out_value, rho, rseed, orchard::note::NoteVersion::V2)).ok_or(PaymentCheckError::Malformed(i))?;
+        let note = Option::<Note>::from(Note::from_parts(recipient, out_value, rho, rseed, orchard::note::NoteVersion::V2))
+            .ok_or(PaymentCheckError::Malformed(i))?;
 
         // (1) The note this action really creates is the note the prover disclosed.
         if ExtractedNoteCommitment::from(note.commitment()).to_bytes() != act.cmx {
@@ -201,11 +322,14 @@ pub fn check_prepared_payment(
 mod tests {
     use super::*;
     use crate::bundle::ActionWire;
+    use orchard::note_encryption::OrchardDomain;
     use orchard::{
         keys::SpendingKey,
         note::{RandomSeed, Rho},
+        note_encryption::OrchardNoteEncryption,
         value::{ValueCommitTrapdoor, ValueCommitment},
     };
+    use zcash_note_encryption::Domain;
 
     // This file guards the one thing a device cannot delegate: that the payment it
     // is about to sign is the payment the user asked for. It had NO tests.
@@ -222,13 +346,19 @@ mod tests {
         let rseed_bytes = [7u8; 32];
         let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(rseed_bytes, &rho)).unwrap();
         let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&to)).unwrap();
-        let note = Option::<Note>::from(Note::from_parts(recipient, NoteValue::from_raw(out_value), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(
+            recipient,
+            NoteValue::from_raw(out_value),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V2,
+        ))
+        .unwrap();
         let cmx = ExtractedNoteCommitment::from(note.commitment()).to_bytes();
 
         let rcv_bytes = [3u8; 32];
         let rcv = Option::<ValueCommitTrapdoor>::from(ValueCommitTrapdoor::from_bytes(rcv_bytes)).unwrap();
-        let cv_net =
-            ValueCommitment::derive(NoteValue::from_raw(spend_value) - NoteValue::from_raw(out_value), rcv).to_bytes();
+        let cv_net = ValueCommitment::derive(NoteValue::from_raw(spend_value) - NoteValue::from_raw(out_value), rcv).to_bytes();
 
         (
             ActionWire {
@@ -261,6 +391,229 @@ mod tests {
         )
     }
 
+    fn encrypted_action(
+        nullifier: [u8; 32],
+        spend_value: u64,
+        out_value: u64,
+        to: [u8; 43],
+        memo: [u8; 512],
+    ) -> (ActionWire, ActionDisclosure) {
+        let (mut wire, disclosure) = action(nullifier, spend_value, out_value, to);
+        let rho = Option::<Rho>::from(Rho::from_bytes(&nullifier)).unwrap();
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(disclosure.out_rseed, &rho)).unwrap();
+        let recipient = Option::<Address>::from(Address::from_raw_address_bytes(&to)).unwrap();
+        let note = Option::<Note>::from(Note::from_parts(
+            recipient,
+            NoteValue::from_raw(out_value),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V2,
+        ))
+        .unwrap();
+        let encryption = OrchardNoteEncryption::new(None, note, memo);
+        wire.ephemeral_key = OrchardDomain::epk_bytes(encryption.epk()).0;
+        wire.enc_ciphertext = encryption.encrypt_note_plaintext();
+        (wire, disclosure)
+    }
+
+    #[test]
+    fn two_distinct_approved_encrypted_outputs_are_accepted() {
+        let fvk = fvk_for([1; 32]);
+        let alice = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let bob = fvk_for([3; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let mut memo = [0u8; 512];
+        memo[..5].copy_from_slice(b"hello");
+        let (wire, disclosure) =
+            bundle(vec![encrypted_action([9; 32], 600, 500, alice, memo), encrypted_action([8; 32], 800, 700, bob, [0; 512])], 200);
+        let intents = [
+            PaymentOutputIntent { recipient: alice, amount: 500, memo },
+            PaymentOutputIntent { recipient: bob, amount: 700, memo: [0; 512] },
+        ];
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &intents, 200, 200), Ok(()));
+    }
+
+    #[test]
+    fn a_payment_memo_or_ciphertext_mutation_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (mut wire, disclosure) = bundle(vec![encrypted_action([9; 32], 1_100, 1_000, to, [0; 512])], 100);
+        let mut intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        intent.memo[0] = 1;
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent], 100, 100),
+            Err(PaymentCheckError::CiphertextMismatch(0))
+        );
+        wire.actions[0].enc_ciphertext[100] ^= 1;
+        let intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent], 100, 100),
+            Err(PaymentCheckError::CiphertextMismatch(0))
+        );
+    }
+
+    #[test]
+    fn a_mutated_ephemeral_key_is_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (mut wire, disclosure) = bundle(vec![encrypted_action([9; 32], 1_100, 1_000, to, [0; 512])], 100);
+        wire.actions[0].ephemeral_key[0] ^= 1;
+        let intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent], 100, 100),
+            Err(PaymentCheckError::CiphertextMismatch(0))
+        );
+    }
+
+    #[test]
+    fn wallet_change_requires_recoverable_ciphertext_and_ephemeral_key() {
+        let fvk = fvk_for([1; 32]);
+        let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (wire, disclosure) = bundle(
+            vec![encrypted_action([9; 32], 1_100, 1_000, to, [0; 512]), encrypted_action([8; 32], 500, 400, mine, [0; 512])],
+            200,
+        );
+        let intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent.clone()], 200, 200), Ok(()));
+        let mut changed = wire.clone();
+        changed.actions[1].enc_ciphertext[100] ^= 1;
+        assert_eq!(
+            check_prepared_payment_multi(&changed, &disclosure, &fvk, &[intent.clone()], 200, 200),
+            Err(PaymentCheckError::CiphertextMismatch(1))
+        );
+        changed = wire;
+        changed.actions[1].ephemeral_key[0] ^= 1;
+        assert_eq!(
+            check_prepared_payment_multi(&changed, &disclosure, &fvk, &[intent], 200, 200),
+            Err(PaymentCheckError::CiphertextMismatch(1))
+        );
+    }
+
+    #[test]
+    fn missing_extra_repeated_and_merged_payments_are_refused() {
+        let fvk = fvk_for([1; 32]);
+        let alice = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let bob = fvk_for([3; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let approved = [
+            PaymentOutputIntent { recipient: alice, amount: 500, memo: [0; 512] },
+            PaymentOutputIntent { recipient: bob, amount: 700, memo: [0; 512] },
+        ];
+        let (missing, d) = bundle(vec![encrypted_action([9; 32], 600, 500, alice, [0; 512])], 100);
+        assert_eq!(check_prepared_payment_multi(&missing, &d, &fvk, &approved, 100, 100), Err(PaymentCheckError::RecipientNotPaid));
+
+        let (extra, d) = bundle(
+            vec![encrypted_action([9; 32], 600, 500, alice, [0; 512]), encrypted_action([8; 32], 800, 700, bob, [0; 512])],
+            200,
+        );
+        assert_eq!(
+            check_prepared_payment_multi(&extra, &d, &fvk, &approved[..1], 200, 200),
+            Err(PaymentCheckError::OutputMismatch(1))
+        );
+
+        let (repeated, d) = bundle(
+            vec![encrypted_action([9; 32], 600, 500, alice, [0; 512]), encrypted_action([8; 32], 600, 500, alice, [0; 512])],
+            200,
+        );
+        assert_eq!(
+            check_prepared_payment_multi(&repeated, &d, &fvk, &approved[..1], 200, 200),
+            Err(PaymentCheckError::OutputMismatch(1))
+        );
+
+        let (merged, d) = bundle(vec![encrypted_action([9; 32], 1_300, 1_200, alice, [0; 512])], 100);
+        assert_eq!(check_prepared_payment_multi(&merged, &d, &fvk, &approved, 100, 100), Err(PaymentCheckError::OutputMismatch(0)));
+    }
+
+    #[test]
+    fn wallet_change_and_zero_dummy_are_allowed_but_invalid_intents_are_refused() {
+        let fvk = fvk_for([1; 32]);
+        let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (wire, disclosure) = bundle(
+            vec![
+                encrypted_action([9; 32], 1_100, 1_000, to, [0; 512]),
+                encrypted_action([8; 32], 500, 400, mine, [0; 512]),
+                action([7; 32], 0, 0, to),
+            ],
+            200,
+        );
+        let intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent.clone()], 200, 200), Ok(()));
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &[], 200, 200), Err(PaymentCheckError::InvalidIntent));
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent.clone(), intent], 200, 200),
+            Err(PaymentCheckError::InvalidIntent)
+        );
+        let owned = PaymentOutputIntent { recipient: mine, amount: 400, memo: [0; 512] };
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &[owned], 200, 200), Err(PaymentCheckError::InvalidIntent));
+        let zero = PaymentOutputIntent { recipient: to, amount: 0, memo: [0; 512] };
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &[zero], 200, 200), Err(PaymentCheckError::InvalidIntent));
+    }
+
+    #[test]
+    fn fee_ceiling_balance_and_disclosure_are_checked() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (mut wire, mut disclosure) = bundle(vec![encrypted_action([9; 32], 1_100, 1_000, to, [0; 512])], 100);
+        let intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent.clone()], 100, 99),
+            Err(PaymentCheckError::InvalidIntent)
+        );
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent.clone()], 101, 101),
+            Err(PaymentCheckError::FeeMismatch { got: 100, want: 101 })
+        );
+        wire.value_balance = 101;
+        assert_eq!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent.clone()], 101, 101),
+            Err(PaymentCheckError::ValueImbalance)
+        );
+        disclosure[0].out_rseed[0] ^= 1;
+        assert!(matches!(
+            check_prepared_payment_multi(&wire, &disclosure, &fvk, &[intent], 101, 101),
+            Err(PaymentCheckError::CommitmentMismatch(0) | PaymentCheckError::Malformed(0))
+        ));
+    }
+
+    #[test]
+    fn intent_sum_and_action_cap_cannot_overflow_the_backend_range() {
+        let fvk = fvk_for([1; 32]);
+        let alice = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let bob = fvk_for([3; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (wire, disclosure) = bundle(vec![encrypted_action([9; 32], 1_100, 1_000, alice, [0; 512])], 100);
+        let huge = [
+            PaymentOutputIntent { recipient: alice, amount: i64::MAX as u64, memo: [0; 512] },
+            PaymentOutputIntent { recipient: bob, amount: 1, memo: [0; 512] },
+        ];
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &huge, 100, 100), Err(PaymentCheckError::InvalidIntent));
+        let too_many = vec![PaymentOutputIntent { recipient: alice, amount: 1, memo: [0; 512] }; MAX_ACTIONS_PER_BUNDLE + 1];
+        assert_eq!(check_prepared_payment_multi(&wire, &disclosure, &fvk, &too_many, 100, 100), Err(PaymentCheckError::InvalidIntent));
+    }
+
+    #[test]
+    fn altered_commitment_and_value_commitment_are_refused() {
+        let fvk = fvk_for([1; 32]);
+        let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
+        let (wire, disclosure) = bundle(vec![encrypted_action([9; 32], 1_100, 1_000, to, [0; 512])], 100);
+        let intent = PaymentOutputIntent { recipient: to, amount: 1_000, memo: [0; 512] };
+        let mut changed = wire.clone();
+        changed.actions[0].cmx[0] ^= 1;
+        assert_eq!(
+            check_prepared_payment_multi(&changed, &disclosure, &fvk, &[intent.clone()], 100, 100),
+            Err(PaymentCheckError::CommitmentMismatch(0))
+        );
+        changed = wire;
+        changed.actions[0].cv_net[0] ^= 1;
+        assert_eq!(
+            check_prepared_payment_multi(&changed, &disclosure, &fvk, &[intent.clone()], 100, 100),
+            Err(PaymentCheckError::ValueCommitmentMismatch(0))
+        );
+        assert_eq!(
+            check_prepared_payment_multi(&changed, &[], &fvk, &[intent], 100, 100),
+            Err(PaymentCheckError::ActionCountMismatch)
+        );
+    }
+
     #[test]
     fn a_payment_of_the_approved_amount_is_accepted() {
         let fvk = fvk_for([1; 32]);
@@ -278,14 +631,8 @@ mod tests {
         // approved 1,000 and the device would have signed 2,000.
         let fvk = fvk_for([1; 32]);
         let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
-        let (b, d) = bundle(
-            vec![action([9; 32], 1_050, 1_000, to), action([8; 32], 1_050, 1_000, to)],
-            100,
-        );
-        assert_eq!(
-            check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100),
-            Err(PaymentCheckError::RecipientPaidTwice { times: 2 })
-        );
+        let (b, d) = bundle(vec![action([9; 32], 1_050, 1_000, to), action([8; 32], 1_050, 1_000, to)], 100);
+        assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100), Err(PaymentCheckError::RecipientPaidTwice { times: 2 }));
     }
 
     #[test]
@@ -294,10 +641,7 @@ mod tests {
         let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
         let stranger = fvk_for([3; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
         let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, stranger)], 100);
-        assert!(matches!(
-            check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100),
-            Err(PaymentCheckError::UnexpectedRecipient(0))
-        ));
+        assert!(matches!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 100), Err(PaymentCheckError::UnexpectedRecipient(0))));
     }
 
     #[test]
@@ -314,10 +658,7 @@ mod tests {
         let fvk = fvk_for([1; 32]);
         let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
         let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
-        let (b, d) = bundle(
-            vec![action([9; 32], 1_100, 1_000, to), action([8; 32], 500, 400, mine)],
-            200,
-        );
+        let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, to), action([8; 32], 500, 400, mine)], 200);
         assert_eq!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 200), Ok(()));
     }
 
@@ -335,9 +676,6 @@ mod tests {
         let fvk = fvk_for([1; 32]);
         let to = fvk_for([2; 32]).address_at(0u32, Scope::External).to_raw_address_bytes();
         let (b, d) = bundle(vec![action([9; 32], 1_100, 1_000, to)], 100);
-        assert!(matches!(
-            check_prepared_payment(&b, &d, &fvk, &to, 1_000, 50),
-            Err(PaymentCheckError::FeeMismatch { .. })
-        ));
+        assert!(matches!(check_prepared_payment(&b, &d, &fvk, &to, 1_000, 50), Err(PaymentCheckError::FeeMismatch { .. })));
     }
 }
