@@ -13,5 +13,11 @@ workspace = true
 [dependencies]
 rand = "0.10"
 kaspa-shielded-core.workspace = true
+zkas-wallet-engine.workspace = true
 orchard = { package = "zakura-orchard", version = "=1.0.1", default-features = false, features = ["std"] }
 zeroize.workspace = true
+
+[dev-dependencies]
+kaspa-shielded-core = { workspace = true, features = ["circuit"] }
+incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
+kaspa-shielded-wallet.workspace = true

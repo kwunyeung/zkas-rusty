@@ -837,7 +837,7 @@ pub mod build {
     use rand_core::{CryptoRng, RngCore};
     use std::sync::OnceLock;
 
-    pub use crate::payment_check::{ActionDisclosure, PaymentCheckError, check_prepared_payment};
+    pub use crate::payment_check::{ActionDisclosure, PaymentCheckError, PaymentOutputIntent, check_prepared_payment};
 
     /// The process-wide Orchard [`ProvingKey`], built once and reused.
     ///
@@ -1554,6 +1554,122 @@ pub mod build {
         })
     }
 
+    /// Prepare one single-owner payment with distinct exact recipient outputs.
+    /// This reuses the shared PCZT builder/prover but never gives it a second
+    /// owner's viewing key. The caller still has to check the resulting bundle
+    /// against approved outputs before authorizing any spend.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_payment_multi(
+        fvk: &FullViewingKey,
+        inputs: Vec<(Note, MerklePath)>,
+        payees: &[PaymentOutputIntent],
+        fee: u64,
+        network_domain: &[u8; 32],
+        tx_context: &[u8],
+        recoverable: bool,
+    ) -> Result<PreparedPayment, BuildError> {
+        if inputs.is_empty() || payees.is_empty() || fee == 0 {
+            return Err(BuildError::Empty);
+        }
+        // Reject hostile list sizes before duplicate checks or value scans.
+        const STANDARD_MASS: usize = 500_000;
+        const TRANSIENT_MASS_PER_BYTE: usize = 4;
+        const TX_ENVELOPE_MARGIN: usize = 256;
+        let maximum_actions = inputs.len().max(payees.len().saturating_add(1)).max(2);
+        if maximum_actions > crate::bundle::MAX_ACTIONS_PER_BUNDLE
+            || crate::bundle::expected_wire_len(maximum_actions) + TX_ENVELOPE_MARGIN
+                > STANDARD_MASS / TRANSIENT_MASS_PER_BYTE
+        {
+            return Err(BuildError::Builder("payment exceeds standard action or mass budget".into()));
+        }
+        let change_address = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let mut paid = 0u64;
+        for (i, payee) in payees.iter().enumerate() {
+            let canonical = Option::<Address>::from(Address::from_raw_address_bytes(&payee.recipient))
+                .filter(|address| address.to_raw_address_bytes() == payee.recipient);
+            if canonical.is_none() || payee.recipient == change_address || payee.amount == 0
+                || payees[..i].iter().any(|prior| prior.recipient == payee.recipient)
+            {
+                return Err(BuildError::Builder("invalid or repeated recipient output".into()));
+            }
+            paid = paid.checked_add(payee.amount).ok_or_else(|| BuildError::Builder("payment amount overflow".into()))?;
+        }
+        let owed = paid.checked_add(fee).ok_or_else(|| BuildError::Builder("payment amount overflow".into()))?;
+        let mut total_in = 0u64;
+        let mut nullifiers = Vec::with_capacity(inputs.len());
+        for (note, _) in &inputs {
+            if note.value().inner() == 0 || fvk.scope_for_address(&note.recipient()).is_none() {
+                return Err(BuildError::Builder("input note is not a positive wallet-owned note".into()));
+            }
+            let nullifier = note.nullifier(fvk).to_bytes();
+            if nullifiers.contains(&nullifier) {
+                return Err(BuildError::Builder("repeated input note".into()));
+            }
+            nullifiers.push(nullifier);
+            total_in = total_in.checked_add(note.value().inner()).ok_or_else(|| BuildError::Builder("input amount overflow".into()))?;
+        }
+        let change = total_in.checked_sub(owed).ok_or_else(|| BuildError::Builder("insufficient input value".into()))?;
+        if total_in > i64::MAX as u64 {
+            return Err(BuildError::Builder("input amount exceeds supported range".into()));
+        }
+        let output_count = payees.len() + usize::from(change > 0);
+        let actions = inputs.len().max(output_count).max(2);
+        // Mirror the existing wallet planner's standard shielded mass budget:
+        // 500,000 / 4 transient bytes, with 256 bytes reserved for the tx envelope.
+        // The wallet/RPC layer must still calculate exact final transaction mass.
+        if actions > crate::bundle::MAX_ACTIONS_PER_BUNDLE
+            || crate::bundle::expected_wire_len(actions) + TX_ENVELOPE_MARGIN > STANDARD_MASS / TRANSIENT_MASS_PER_BYTE
+        {
+            return Err(BuildError::Builder("payment exceeds standard action or mass budget".into()));
+        }
+
+        let ovk = recoverable.then(|| fvk.to_ovk(Scope::External));
+        let spends = inputs.into_iter().map(|(note, path)| MultiSpend { fvk: fvk.clone(), note, path }).collect();
+        let mut outputs: Vec<MultiOutput> = payees
+            .iter()
+            .map(|payee| MultiOutput { ovk: ovk.clone(), recipient: payee.recipient, value: payee.amount, memo: payee.memo })
+            .collect();
+        if change > 0 {
+            outputs.push(MultiOutput { ovk, recipient: change_address, value: change, memo: [0; 512] });
+        }
+        let prepared = prepare_multiparty(spends, outputs, fee, network_domain, tx_context)?;
+        let mut owners: Vec<_> = prepared.spend_owners.iter().map(|(action, _)| *action).collect();
+        owners.sort_unstable();
+        let mut requests: Vec<_> = prepared.payment.spend_auth_requests.iter().map(|(action, _)| *action).collect();
+        requests.sort_unstable();
+        if owners != requests {
+            return Err(BuildError::Builder("real spend authorization mapping is incomplete".into()));
+        }
+        crate::payment_check::check_prepared_payment_multi(
+            &prepared.payment.effects,
+            &prepared.payment.disclosure,
+            fvk,
+            payees,
+            fee,
+            fee,
+        )
+        .map_err(|error| BuildError::Builder(format!("prepared payment output verification failed: {error}")))?;
+        Ok(prepared.payment)
+    }
+
+    /// Finalize a prepared batch only with one signature for every requested
+    /// real spend. This bounds indices before the legacy finalizer indexes PCZT.
+    pub fn finalize_payment_multi(
+        prepared: PreparedPayment,
+        device_sigs: Vec<(usize, [u8; 64])>,
+    ) -> Result<ShieldedBundle, BuildError> {
+        let mut expected: Vec<_> = prepared.spend_auth_requests.iter().map(|(i, _)| *i).collect();
+        let mut received: Vec<_> = device_sigs.iter().map(|(i, _)| *i).collect();
+        expected.sort_unstable();
+        received.sort_unstable();
+        if expected != received || received.windows(2).any(|pair| pair[0] == pair[1])
+            || received.iter().any(|&i| i >= prepared.effects.actions.len())
+        {
+            return Err(BuildError::Builder("incomplete or repeated spend signatures".into()));
+        }
+        finalize_payment(prepared, device_sigs)
+    }
+
 
     /// Decode a 96-byte full viewing key. Exposed so a caller assembling a shared
     /// bundle (walletd, an SDK) can turn a party's `fvk_hex` into a key without
@@ -1872,6 +1988,80 @@ pub mod build {
             let msg = crate::verify::sighash(&wire, &net, ctx);
             crate::verify::verify_bundle(&wire, &msg).expect("non-custodial payment must verify");
             assert_eq!(wire.value_balance, 1_000);
+        }
+
+        #[test]
+        fn one_owner_prepares_two_exact_outputs_in_one_bundle() {
+            let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();
+            let alice = ShieldedKeys::from_seed([8u8; 32]).unwrap().address().to_raw_address_bytes();
+            let bob = keys.fvk.address_at(1u32, Scope::External).to_raw_address_bytes();
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let auth_path: [MerkleHashOrchard; 32] =
+                core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8)));
+            let path = MerklePath::from_parts(0, auth_path);
+            let mut memo = [0u8; 512];
+            memo[..5].copy_from_slice(b"hello");
+            let payees = [
+                crate::payment_check::PaymentOutputIntent { recipient: alice, amount: 3_000, memo },
+                crate::payment_check::PaymentOutputIntent { recipient: bob, amount: 2_000, memo: [0; 512] },
+            ];
+            let network = [0x55; 32];
+            let context = b"zkas-nc-api";
+            let prepared = prepare_payment_multi(&keys.fvk, vec![(note, path)], &payees, 1_000, &network, context, true).unwrap();
+            assert_eq!(prepared.value_balance, 1_000);
+            crate::payment_check::check_prepared_payment_multi(&prepared.effects, &prepared.disclosure, &keys.fvk, &payees, 1_000, 1_000).unwrap();
+            crate::payment_check::check_prepared_payment_multi_recoverable(&prepared.effects, &prepared.disclosure, &keys.fvk, &payees, 1_000, 1_000).unwrap();
+            let mut unrecoverable = prepared.effects.clone();
+            let positive = prepared.disclosure.iter().position(|d| d.out_value > 0 && d.out_recipient == alice).unwrap();
+            unrecoverable.actions[positive].out_ciphertext[0] ^= 1;
+            assert!(crate::payment_check::check_prepared_payment_multi_recoverable(&unrecoverable, &prepared.disclosure, &keys.fvk, &payees, 1_000, 1_000).is_err());
+            let ask = SpendAuthorizingKey::from(&keys.sk);
+            let signatures: Vec<_> = prepared.spend_auth_requests.iter().map(|(i, alpha)| (*i, sign_spend_auth(&ask, *alpha, prepared.sighash).unwrap())).collect();
+            let wire = finalize_payment_multi(prepared, signatures).unwrap();
+            let sighash = crate::verify::sighash(&wire, &network, context);
+            crate::verify::verify_bundle(&wire, &sighash).unwrap();
+        }
+
+        #[test]
+        fn multi_payment_rejects_bad_inputs_before_proving() {
+            let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();
+            let other = ShieldedKeys::from_seed([8u8; 32]).unwrap();
+            let recipient = ShieldedKeys::from_seed([9u8; 32]).unwrap().address().to_raw_address_bytes();
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let path = MerklePath::from_parts(0, core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8))));
+            let payee = crate::payment_check::PaymentOutputIntent { recipient, amount: 1_000, memo: [0; 512] };
+            let run = |inputs, payees: &[crate::payment_check::PaymentOutputIntent]| {
+                prepare_payment_multi(&keys.fvk, inputs, payees, 100, &[0x55; 32], b"ctx", true)
+            };
+            assert!(matches!(run(vec![(note, path.clone()), (note, path.clone())], &[payee.clone()]), Err(BuildError::Builder(message)) if message.contains("repeated input")));
+            assert!(matches!(run(vec![(note, path.clone())], &[payee.clone(), payee.clone()]), Err(BuildError::Builder(message)) if message.contains("repeated recipient")));
+            let foreign_note = Option::<Note>::from(Note::from_parts(other.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            assert!(matches!(run(vec![(foreign_note, path.clone())], &[payee.clone()]), Err(BuildError::Builder(message)) if message.contains("wallet-owned")));
+            let too_many = vec![payee.clone(); crate::bundle::MAX_ACTIONS_PER_BUNDLE + 1];
+            assert!(matches!(run(vec![(note, path.clone())], &too_many), Err(BuildError::Builder(message)) if message.contains("mass budget")));
+            let huge = crate::payment_check::PaymentOutputIntent { recipient, amount: u64::MAX, memo: [0; 512] };
+            assert!(matches!(run(vec![(note, path.clone())], &[huge]), Err(BuildError::Builder(message)) if message.contains("overflow")));
+            let second_rho = Option::<Rho>::from(Rho::from_bytes(&canon(5))).unwrap();
+            let second_seed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(6), &second_rho)).unwrap();
+            let second_note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), second_rho, second_seed, orchard::note::NoteVersion::V2)).unwrap();
+            assert!(run(vec![(note, path.clone()), (second_note, path)], &[payee]).is_err());
+        }
+
+        #[test]
+        fn multi_finalizer_rejects_out_of_range_signature_index() {
+            let keys = ShieldedKeys::from_seed([7u8; 32]).unwrap();
+            let recipient = ShieldedKeys::from_seed([8u8; 32]).unwrap().address().to_raw_address_bytes();
+            let rho = Option::<Rho>::from(Rho::from_bytes(&canon(3))).unwrap();
+            let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(canon(4), &rho)).unwrap();
+            let note = Option::<Note>::from(Note::from_parts(keys.address(), NoteValue::from_raw(10_000), rho, rseed, orchard::note::NoteVersion::V2)).unwrap();
+            let path = MerklePath::from_parts(0, core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8))));
+            let payees = [crate::payment_check::PaymentOutputIntent { recipient, amount: 1_000, memo: [0; 512] }];
+            let prepared = prepare_payment_multi(&keys.fvk, vec![(note, path)], &payees, 100, &[0x55; 32], b"ctx", true).unwrap();
+            assert!(finalize_payment_multi(prepared, vec![(usize::MAX, [0; 64])]).is_err());
         }
 
         /// The full loop: the wallet builds a real shielded bundle, and the
@@ -2408,5 +2598,5 @@ pub mod build {
 #[cfg(feature = "circuit")]
 pub use build::{
     BuildError, PreparedPayment, ShieldedKeys, build_output_only_bundle, build_payment_bundle, build_spend_bundle, finalize_payment,
-    prepare_payment, sign_spend_auth, to_wire,
+    finalize_payment_multi, prepare_payment, prepare_payment_multi, sign_spend_auth, to_wire,
 };

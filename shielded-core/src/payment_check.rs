@@ -62,6 +62,8 @@ pub enum PaymentCheckError {
     InvalidIntent,
     /// A payment output or its approved memo differs from the encrypted wire bytes.
     CiphertextMismatch(usize),
+    /// A positive output cannot be recovered with this wallet's outgoing key.
+    OutgoingRecoveryMismatch(usize),
     /// An approved output is absent or an unapproved positive output is present.
     OutputMismatch(usize),
     /// Disclosure does not cover every action in the bundle.
@@ -93,6 +95,7 @@ impl core::fmt::Display for PaymentCheckError {
         match self {
             Self::InvalidIntent => write!(f, "invalid prepared payment intent set"),
             Self::CiphertextMismatch(i) => write!(f, "action {i}: recipient ciphertext or ephemeral key differs from approval"),
+            Self::OutgoingRecoveryMismatch(i) => write!(f, "action {i}: outgoing ciphertext does not recover the approved output"),
             Self::OutputMismatch(i) => write!(f, "action {i}: payment output differs from approval"),
             Self::ActionCountMismatch => write!(f, "prover disclosed the wrong number of actions"),
             Self::CommitmentMismatch(i) => write!(f, "action {i}: the note it creates is not the one disclosed"),
@@ -204,6 +207,52 @@ pub fn check_prepared_payment_multi(
     }
     if wire.value_balance != fee as i64 {
         return Err(PaymentCheckError::FeeMismatch { got: wire.value_balance, want: fee });
+    }
+    Ok(())
+}
+
+/// As [`check_prepared_payment_multi`], also require the wallet's outgoing key
+/// to recover every positive payment and change note with its exact memo. This
+/// is the appropriate profile when the sender is promised recoverable history.
+pub fn check_prepared_payment_multi_recoverable(
+    wire: &ShieldedBundle,
+    disclosure: &[ActionDisclosure],
+    fvk: &FullViewingKey,
+    intents: &[PaymentOutputIntent],
+    fee: u64,
+    max_fee: u64,
+) -> Result<(), PaymentCheckError> {
+    use zcash_note_encryption::try_output_recovery_with_ovk;
+
+    check_prepared_payment_multi(wire, disclosure, fvk, intents, fee, max_fee)?;
+    let mine = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+    let ovk = fvk.to_ovk(Scope::External);
+    for (i, (wire_action, d)) in wire.actions.iter().zip(disclosure).enumerate() {
+        if d.out_value == 0 {
+            continue;
+        }
+        let action = crate::wallet::scan::reconstruct_action(wire_action).ok_or(PaymentCheckError::Malformed(i))?;
+        let domain = OrchardDomain::for_action(&action);
+        let (note, recipient, memo) =
+            try_output_recovery_with_ovk(&domain, &ovk, &action, action.cv_net(), &wire_action.out_ciphertext)
+                .ok_or(PaymentCheckError::OutgoingRecoveryMismatch(i))?;
+        let expected_memo = if d.out_recipient == mine {
+            [0u8; 512]
+        } else {
+            intents
+                .iter()
+                .find(|intent| intent.recipient == d.out_recipient && intent.amount == d.out_value)
+                .ok_or(PaymentCheckError::OutputMismatch(i))?
+                .memo
+        };
+        if recipient.to_raw_address_bytes() != d.out_recipient
+            || note.value().inner() != d.out_value
+            || note.rseed().as_bytes() != &d.out_rseed
+            || ExtractedNoteCommitment::from(note.commitment()).to_bytes() != wire_action.cmx
+            || memo != expected_memo
+        {
+            return Err(PaymentCheckError::OutgoingRecoveryMismatch(i));
+        }
     }
     Ok(())
 }

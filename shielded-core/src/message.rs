@@ -158,6 +158,17 @@ pub fn sign_spend_auth_from_seed(seed: [u8; 32], alpha: [u8; 32], sighash: [u8; 
     Some(<[u8; 64]>::from(&sig))
 }
 
+/// Derive the randomized validating key that must appear in the action for a
+/// spend authorization request. A signer checks this before signing the hash.
+pub fn spend_auth_rk_from_seed(seed: [u8; 32], alpha: [u8; 32]) -> Option<[u8; 32]> {
+    use group::ff::PrimeField;
+    let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+    let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(alpha))?;
+    let ask = SpendAuthorizingKey::from(&sk);
+    let randomized = ask.randomize(&alpha);
+    Some(<[u8; 32]>::from(VerificationKey::<SpendAuth>::from(&randomized)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

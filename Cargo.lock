@@ -10038,10 +10038,13 @@ dependencies = [
 name = "zkas-signer"
 version = "2.0.1"
 dependencies = [
+ "incrementalmerkletree",
  "kaspa-shielded-core",
+ "kaspa-shielded-wallet",
  "rand 0.10.1",
  "zakura-orchard",
  "zeroize",
+ "zkas-wallet-engine",
 ]
 
 [[package]]
