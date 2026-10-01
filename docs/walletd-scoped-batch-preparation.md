@@ -23,4 +23,18 @@ The response contains a random, short-lived `capability`, the `logicalId`, and `
 
 One reservation per normalized viewing key excludes concurrent legacy preparations and unexpired unsigned legacy sessions. The non-custodial profile also disables seed-backed background consolidation, including for seed wallets left on disk. Preparation uses matured wallet notes, a canonical checkpoint, one complete transaction, a fee at or below the approved ceiling, and recoverable positive outputs and change. Capacity is bounded to 64 active grants per daemon. Grants and unsigned prepared results are in memory; a restart drops them. Proving continues past the initial 15-minute capability lifetime, and a completed result receives a fresh 15-minute retrieval lifetime.
 
-This API stops at unsigned preparation. It has no multi-output signing, finalization, journal, or broadcast route. The version-3 envelope still requires independent local approval and SDK signing checks; exact serialized transaction mass, proof/signature validation, acceptance, and retry-safe submission belong to finalization and submission. The legacy single-output API retains its existing behavior.
+The wallet-controlled client independently checks the version-3 envelope against the locally approved intent and signs every real spend. It then calls `POST /api/wallet/finalize-many` using the normal wallet token and daemon bearer, with a JSON body:
+
+```json
+{
+  "account": "zkas:...",
+  "genesis": "64 lowercase hex characters",
+  "logicalId": "64 lowercase hex characters",
+  "session": "48 lowercase hex characters from the credentialed preparation response",
+  "signatures": [{"actionIndex": 0, "signatureHex": "128 lowercase hex characters"}]
+}
+```
+
+The body is limited to 16 KiB. The registered watch-only account, daemon genesis, logical ID, and session must all match the prepared request. Every requested real spend must have one unique valid signature; a missing, repeated, out-of-range, or invalid signature leaves the prepared session available for correction. A valid request finalizes once. The daemon checks the completed bundle proof, spend authorizations, binding signature, original recipient/amount/memo intent, fee ceiling, normal shielded-payment transaction context, actual serialized transaction mass, and conservative network mempool limits. The response contains `status: "finalized"`, `logicalId`, `transactionHex`, `txid`, and `sha256`. `transactionHex` is the complete Borsh-encoded signed `Transaction`, with the Orchard wire bundle in its payload; `sha256` hashes exactly those decoded transaction bytes. A retry with the same signatures within the finalized result's 15-minute lifetime returns the identical bytes and identifiers without finalizing again. Different signatures conflict. The finalized result remains reserved in memory; a restart loses it.
+
+This increment does not submit or broadcast. Before a live send flow can use it, the next increment must durably write and fsync the signed bytes and intent association, recover an `UNKNOWN` outcome after uncertain submission or restart, reconcile transaction identity with the node before any retry, and gate legacy in-flight payments against the same viewing-key reservation. Until that journal and exact submit/status path exists, a finalized response is only an offline signed artifact. The legacy single-output API retains its existing behavior.

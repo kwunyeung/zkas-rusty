@@ -59,4 +59,10 @@ rustls.workspace = true
 rcgen = "0.13"
 qrcode = { version = "0.14", default-features = false }
 sha2.workspace = true
+borsh.workspace = true
+# Verify each spend authorization before moving the one-use prepared proof.
+orchard = { package = "zakura-orchard", version = "=1.0.1", default-features = false, features = ["std", "weighted-merkle"] }
 hex.workspace = true
+
+[dev-dependencies]
+incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }

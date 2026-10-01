@@ -2,6 +2,8 @@
 
 use super::*;
 use kaspa_shielded_core::payment_check::PaymentOutputIntent;
+use orchard::primitives::redpallas::{Signature, SpendAuth, VerificationKey};
+use sha2::Digest;
 use zkas_sdk::BatchIntent;
 
 const GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
@@ -33,6 +35,7 @@ struct BatchRecord {
     capability_expires: std::time::Instant,
     capability_expires_unix: u64,
     expires: std::time::Instant,
+    session: Option<String>,
     phase: BatchPhase,
 }
 
@@ -40,16 +43,57 @@ enum BatchPhase {
     Issued,
     Proving,
     Ready(Box<BatchPrepared>),
+    Finalizing,
+    Finalized(Box<BatchFinalized>),
     Failed,
 }
 
-#[allow(dead_code)] // Retained for a separate finalization route; this route only prepares.
 struct BatchPrepared {
     payment: PreparedPayment,
     positions: Vec<u64>,
     amount: u64,
     fee: u64,
     response: BatchPrepareResp,
+}
+
+struct BatchFinalized {
+    response: BatchFinalizeResp,
+    signatures: Vec<(usize, [u8; 64])>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BatchFinalizeResp {
+    status: &'static str,
+    logical_id: String,
+    transaction_hex: String,
+    txid: String,
+    sha256: String,
+}
+
+impl BatchFinalized {
+    fn new(bytes: Vec<u8>, txid: String, logical_id: [u8; 32], signatures: Vec<(usize, [u8; 64])>) -> Self {
+        Self {
+            response: BatchFinalizeResp {
+                status: "finalized",
+                logical_id: hex(&logical_id),
+                transaction_hex: hex(&bytes),
+                txid,
+                sha256: hex(&sha2::Sha256::digest(&bytes)),
+            },
+            signatures,
+        }
+    }
+
+    fn retry(&self, signatures: &[(usize, [u8; 64])]) -> Result<&BatchFinalizeResp, &'static str> {
+        if self.signatures == signatures { Ok(&self.response) } else { Err("finalized signatures differ") }
+    }
+}
+
+enum BatchFinalizeStart {
+    New(Box<BatchPrepared>, BatchIntent),
+    InProgress,
+    Ready(BatchFinalizeResp),
 }
 
 #[derive(Clone, Serialize)]
@@ -79,7 +123,7 @@ pub(super) enum BatchStart {
 
 impl BatchRecord {
     fn active(&self, now: std::time::Instant) -> bool {
-        matches!(self.phase, BatchPhase::Proving) || self.expires > now
+        matches!(self.phase, BatchPhase::Proving | BatchPhase::Finalizing) || self.expires > now
     }
 }
 
@@ -144,6 +188,7 @@ impl BatchRegistry {
                 capability_expires: now + GRANT_TTL,
                 capability_expires_unix: now_unix() + GRANT_TTL.as_secs(),
                 expires: now + GRANT_TTL,
+                session: None,
                 phase: BatchPhase::Issued,
             },
         );
@@ -169,6 +214,8 @@ impl BatchRegistry {
             }
             BatchPhase::Proving => Ok(BatchStart::InProgress),
             BatchPhase::Ready(ref prepared) => Ok(BatchStart::Ready(prepared.response.clone())),
+            BatchPhase::Finalizing => Ok(BatchStart::InProgress),
+            BatchPhase::Finalized(_) => Ok(BatchStart::Ready(BatchPrepareResp::finalized(record.logical_id))),
             BatchPhase::Failed => Ok(BatchStart::Failed),
         }
     }
@@ -186,6 +233,7 @@ impl BatchRegistry {
     fn finish_success(&mut self, fvk: &[u8; 96], prepared: BatchPrepared, now: std::time::Instant) {
         match self.records.get_mut(fvk) {
             Some(record) if matches!(record.phase, BatchPhase::Proving) => {
+                record.session = prepared.response.session.clone();
                 record.phase = BatchPhase::Ready(Box::new(prepared));
                 record.expires = now + GRANT_TTL;
             }
@@ -207,8 +255,59 @@ impl BatchRegistry {
         Ok(match &record.phase {
             BatchPhase::Issued | BatchPhase::Proving => BatchPrepareResp::pending(record.logical_id),
             BatchPhase::Ready(prepared) => prepared.response.clone(),
+            BatchPhase::Finalizing => BatchPrepareResp::pending(record.logical_id),
+            BatchPhase::Finalized(_) => BatchPrepareResp::finalized(record.logical_id),
             BatchPhase::Failed => BatchPrepareResp::failed(record.logical_id),
         })
+    }
+
+    fn begin_finalize(
+        &mut self,
+        fvk: &[u8; 96],
+        token: &str,
+        logical_id: [u8; 32],
+        session: &str,
+        account: [u8; 43],
+        genesis: &[u8; 32],
+        signatures: &[(usize, [u8; 64])],
+        now: std::time::Instant,
+    ) -> Result<BatchFinalizeStart, &'static str> {
+        let record = self.records.get_mut(fvk).ok_or("unknown preparation")?;
+        if !record.active(now)
+            || record.token != token
+            || record.logical_id != logical_id
+            || record.intent.account != account
+            || record.session.as_deref() != Some(session)
+        {
+            return Err("unknown preparation");
+        }
+        match &record.phase {
+            BatchPhase::Ready(prepared) => {
+                validate_spend_signatures(&prepared.payment, signatures, genesis)?;
+                let phase = std::mem::replace(&mut record.phase, BatchPhase::Finalizing);
+                match phase {
+                    BatchPhase::Ready(prepared) => Ok(BatchFinalizeStart::New(prepared, record.intent.clone())),
+                    _ => unreachable!(),
+                }
+            }
+            BatchPhase::Finalizing => Ok(BatchFinalizeStart::InProgress),
+            BatchPhase::Finalized(finalized) => Ok(BatchFinalizeStart::Ready(finalized.retry(signatures)?.clone())),
+            _ => Err("preparation is not ready"),
+        }
+    }
+
+    fn finish_finalize(&mut self, fvk: &[u8; 96], outcome: Result<BatchFinalized, &'static str>) {
+        if let Some(record) = self.records.get_mut(fvk)
+            && matches!(record.phase, BatchPhase::Finalizing)
+        {
+            record.phase = match outcome {
+                Ok(finalized) => {
+                    record.expires = std::time::Instant::now() + GRANT_TTL;
+                    BatchPhase::Finalized(Box::new(finalized))
+                }
+                Err(_) => BatchPhase::Failed,
+            };
+        }
     }
 }
 
@@ -221,9 +320,257 @@ impl BatchPrepareResp {
         Self { status: "failed", logical_id: hex(&logical_id), session: None, prepared_payment: None }
     }
 
+    fn finalized(logical_id: [u8; 32]) -> Self {
+        Self { status: "finalized", logical_id: hex(&logical_id), session: None, prepared_payment: None }
+    }
+
     fn capability_view(&self) -> Self {
         Self { status: self.status, logical_id: self.logical_id.clone(), session: None, prepared_payment: None }
     }
+}
+
+fn validate_signature_indices(
+    requests: &[(usize, [u8; 32])],
+    signatures: &[(usize, [u8; 64])],
+    action_count: usize,
+) -> Result<(), &'static str> {
+    let mut expected: Vec<_> = requests.iter().map(|(index, _)| *index).collect();
+    let mut actual: Vec<_> = signatures.iter().map(|(index, _)| *index).collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if expected.is_empty()
+        || expected != actual
+        || expected.windows(2).any(|pair| pair[0] == pair[1])
+        || actual.iter().any(|&index| index >= action_count)
+    {
+        return Err("incomplete or repeated spend signatures");
+    }
+    Ok(())
+}
+
+fn validate_spend_signatures(
+    prepared: &PreparedPayment,
+    signatures: &[(usize, [u8; 64])],
+    genesis: &[u8; 32],
+) -> Result<(), &'static str> {
+    validate_signature_indices(&prepared.spend_auth_requests, signatures, prepared.effects.actions.len())?;
+    let sighash = kaspa_shielded_core::verify::sighash(&prepared.effects, genesis, &payment_tx_context());
+    if sighash != prepared.sighash {
+        return Err("prepared payment sighash mismatch");
+    }
+    for (index, bytes) in signatures {
+        let action = &prepared.effects.actions[*index];
+        let key = VerificationKey::<SpendAuth>::try_from(action.rk).map_err(|_| "invalid action verification key")?;
+        key.verify(&sighash, &Signature::<SpendAuth>::from(*bytes)).map_err(|_| "invalid spend signature")?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BatchSignatureReq {
+    action_index: usize,
+    signature_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BatchFinalizeReq {
+    account: String,
+    genesis: String,
+    logical_id: String,
+    session: String,
+    signatures: Vec<BatchSignatureReq>,
+}
+
+fn lowercase_hex<const N: usize>(value: &str) -> Result<[u8; N], &'static str> {
+    if value.len() != N * 2 || !value.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')) {
+        return Err("invalid lowercase hex field");
+    }
+    hex::decode(value).map_err(|_| "invalid hex field")?.try_into().map_err(|_| "invalid hex field")
+}
+
+pub(super) async fn finalize_many(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<BatchFinalizeReq>,
+) -> Result<Json<BatchFinalizeResp>, BatchHttpError> {
+    if !supported_profile(state.allow_custodial, state.enable_multiparty, &state.network) {
+        return Err(err(
+            StatusCode::NOT_IMPLEMENTED,
+            "batch finalization requires a supported watch-only, single-owner daemon profile",
+        ));
+    }
+    let token = token_from(&headers, false)?;
+    let wallet = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no registered wallet"))?;
+    let (fvk, account) = {
+        let entry = wallet.lock().await;
+        if !entry.key.is_watch_only() {
+            return Err(err(StatusCode::FORBIDDEN, "batch finalization requires a watch-only wallet"));
+        }
+        (entry.db.fvk().to_bytes(), entry.db.my_address_bytes())
+    };
+    let address = Address::try_from(req.account.as_str()).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid account"))?;
+    if address.prefix != state.prefix
+        || address.version != Version::ShieldedOrchard
+        || orchard_recipient_bytes(&address) != Some(account)
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "account mismatch"));
+    }
+    if lowercase_hex::<32>(&req.genesis).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))? != state.genesis.as_bytes() {
+        return Err(err(StatusCode::BAD_REQUEST, "genesis mismatch"));
+    }
+    let logical_id = lowercase_hex::<32>(&req.logical_id).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))?;
+    lowercase_hex::<24>(&req.session).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))?;
+    if req.signatures.is_empty() || req.signatures.len() > max_actions_per_tx() {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid signature count"));
+    }
+    let mut signatures = Vec::with_capacity(req.signatures.len());
+    for signature in &req.signatures {
+        let bytes = lowercase_hex::<64>(&signature.signature_hex).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))?;
+        signatures.push((signature.action_index, bytes));
+    }
+    signatures.sort_unstable_by_key(|(index, _)| *index);
+    let start = {
+        let mut registry =
+            state.batch_preparations.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "batch tracker poisoned"))?;
+        // Authentication, session binding and signature validation precede the
+        // state transition, so an invalid signature cannot consume a session.
+        registry
+            .begin_finalize(
+                &fvk,
+                &token,
+                logical_id,
+                &req.session,
+                account,
+                &state.genesis.as_bytes(),
+                &signatures,
+                std::time::Instant::now(),
+            )
+            .map_err(|reason| err(StatusCode::CONFLICT, reason))?
+    };
+    match start {
+        BatchFinalizeStart::Ready(response) => Ok(Json(response)),
+        BatchFinalizeStart::InProgress => Err(err(StatusCode::CONFLICT, "finalization in progress; retry the same request")),
+        BatchFinalizeStart::New(prepared, intent) => {
+            let state_for_task = state.clone();
+            let signatures_for_task = signatures;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || {
+                    finalize_batch_prepared(
+                        *prepared,
+                        intent,
+                        signatures_for_task,
+                        logical_id,
+                        fvk,
+                        state_for_task.genesis.as_bytes(),
+                        &state_for_task.network,
+                    )
+                })
+                .await
+                .unwrap_or(Err("finalization task failed"));
+                let response = outcome.as_ref().map(|finalized| finalized.response.clone()).map_err(|error| *error);
+                if let Ok(mut registry) = state.batch_preparations.lock() {
+                    registry.finish_finalize(&fvk, outcome);
+                }
+                let _ = sender.send(response);
+            });
+            match receiver.await {
+                Ok(Ok(response)) => Ok(Json(response)),
+                Ok(Err(reason)) => Err(err(StatusCode::BAD_REQUEST, reason)),
+                Err(_) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, "finalization task unavailable")),
+            }
+        }
+    }
+}
+
+fn finalize_batch_prepared(
+    prepared: BatchPrepared,
+    intent: BatchIntent,
+    signatures: Vec<(usize, [u8; 64])>,
+    logical_id: [u8; 32],
+    fvk_bytes: [u8; 96],
+    genesis: [u8; 32],
+    network: &str,
+) -> Result<BatchFinalized, &'static str> {
+    let fvk = fvk_from_bytes(&fvk_bytes).ok_or("invalid wallet viewing key")?;
+    let typed = prepared
+        .response
+        .prepared_payment
+        .as_ref()
+        .ok_or("missing prepared envelope")?
+        .to_typed()
+        .map_err(|_| "invalid prepared envelope")?;
+    let total = intent.outputs.iter().try_fold(0u64, |sum, output| sum.checked_add(output.amount)).ok_or("payment amount overflow")?;
+    if prepared.positions.is_empty()
+        || prepared.positions.len() != prepared.payment.spend_auth_requests.len()
+        || prepared.amount != total
+    {
+        return Err("prepared payment metadata mismatch");
+    }
+    let expected_fee = prepared.fee;
+    if typed.network_domain != genesis
+        || typed.tx_context != payment_tx_context()
+        || typed.claimed_account != intent.account
+        || typed.claimed_outputs != intent.outputs
+        || typed.claimed_fee != expected_fee
+        || typed.claimed_fee > intent.max_fee
+        || typed.bundle != prepared.payment.effects
+    {
+        return Err("prepared payment context mismatch");
+    }
+    kaspa_shielded_core::payment_check::check_prepared_payment_multi_recoverable(
+        &prepared.payment.effects,
+        &prepared.payment.disclosure,
+        &fvk,
+        &intent.outputs,
+        expected_fee,
+        intent.max_fee,
+    )
+    .map_err(|_| "prepared payment output recovery failed")?;
+    validate_spend_signatures(&prepared.payment, &signatures, &genesis)?;
+    let bundle = kaspa_shielded_core::wallet::build::finalize_payment_multi(prepared.payment, signatures.clone())
+        .map_err(|_| "payment finalization failed")?;
+    let sighash = kaspa_shielded_core::verify::sighash(&bundle, &genesis, &payment_tx_context());
+    kaspa_shielded_core::verify::verify_bundle(&bundle, &sighash).map_err(|_| "completed payment verification failed")?;
+    if bundle.flags != 3
+        || bundle.burn.is_some()
+        || bundle.value_balance != expected_fee as i64
+        || bundle.actions.len() < 2
+        || bundle.actions.len() > max_actions_per_tx()
+        || expected_fee < min_relay_fee_for_actions(bundle.actions.len())
+    {
+        return Err("completed payment shape mismatch");
+    }
+    let wire = bundle.to_bytes();
+    if kaspa_shielded_core::bundle::ShieldedBundle::from_bytes(&wire).map_err(|_| "noncanonical bundle")? != bundle {
+        return Err("noncanonical bundle");
+    }
+    let tx = payment_tx(wire);
+    if tx.version != TX_VERSION_SHIELDED
+        || !tx.inputs.is_empty()
+        || !tx.outputs.is_empty()
+        || tx.lock_time != 0
+        || tx.gas != 0
+        || tx.shielded_sighash_context() != payment_tx_context()
+    {
+        return Err("noncanonical payment transaction");
+    }
+    let params = kaspa_consensus_core::config::params::Params::from(state_prefix_network(network));
+    let mass = kaspa_consensus_core::mass::MassCalculator::new_with_consensus_params(&params).calc_non_contextual_masses(&tx);
+    let limits = params.mempool_block_mass_limits().before();
+    if mass.compute_mass > limits.compute.min(zkas_wallet_engine::payment::STANDARD_TX_MASS_CAP)
+        || mass.transient_mass > limits.transient.min(zkas_wallet_engine::payment::STANDARD_TX_MASS_CAP)
+    {
+        return Err("completed payment exceeds network mass limit");
+    }
+    let bytes = borsh::to_vec(&tx).map_err(|_| "transaction serialization failed")?;
+    let decoded: Transaction = borsh::from_slice(&bytes).map_err(|_| "transaction roundtrip failed")?;
+    if decoded != tx || decoded.id() != tx.id() {
+        return Err("transaction roundtrip mismatch");
+    }
+    Ok(BatchFinalized::new(bytes, hex(&tx.id().as_bytes()), logical_id, signatures))
 }
 
 #[derive(Clone, Deserialize)]
@@ -705,5 +1052,155 @@ mod tests {
         assert_eq!(json["status"], "prepared");
         assert!(json.get("session").is_none());
         assert!(json.get("preparedPayment").is_none());
+    }
+
+    #[test]
+    fn finalize_request_rejects_repeated_and_incomplete_signatures_before_consumption() {
+        let requests = [(1usize, [3u8; 32]), (3usize, [4u8; 32])];
+        assert!(validate_signature_indices(&requests, &[(1, [0u8; 64])], 4).is_err());
+        assert!(validate_signature_indices(&requests, &[(1, [0u8; 64]), (1, [0u8; 64])], 4).is_err());
+        assert!(validate_signature_indices(&requests, &[(1, [0u8; 64]), (4, [0u8; 64])], 4).is_err());
+        assert!(validate_signature_indices(&requests, &[(1, [0u8; 64]), (3, [0u8; 64])], 4).is_ok());
+    }
+
+    #[test]
+    fn finalized_bytes_are_immutable_for_identical_retry() {
+        let first = BatchFinalized::new(vec![1, 2, 3], "abcd".into(), [7; 32], vec![(0, [1; 64])]);
+        let first_json = serde_json::to_vec(&first.response).unwrap();
+        assert_eq!(first.response.transaction_hex, "010203");
+        assert_eq!(first.response.sha256, hex(&sha2::Sha256::digest([1, 2, 3])));
+        assert_eq!(first.retry(&[(0, [1; 64])]).unwrap().transaction_hex, first.response.transaction_hex);
+        assert_eq!(serde_json::to_vec(first.retry(&[(0, [1; 64])]).unwrap()).unwrap(), first_json);
+        assert!(first.retry(&[(0, [2; 64])]).is_err());
+    }
+
+    #[test]
+    fn finalizing_keeps_wallet_reserved_when_unsigned_ttl_passes() {
+        let now = std::time::Instant::now();
+        let fvk = [9; 96];
+        let intent = BatchIntent { account: [5; 43], outputs: vec![], max_fee: 10 };
+        let mut registry = BatchRegistry::default();
+        registry.issue(fvk, "owner", "https://example.test", [7; 32], intent.clone(), now).unwrap();
+        let record = registry.records.get_mut(&fvk).unwrap();
+        record.phase = BatchPhase::Finalizing;
+        record.expires = now;
+        let later = now + GRANT_TTL;
+        assert!(registry.reserves(&fvk, later));
+        assert!(registry.issue(fvk, "owner", "https://example.test", [8; 32], intent, later).is_err());
+    }
+
+    #[test]
+    fn real_proof_invalid_signature_preserves_session_then_finalizes_once() {
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::{
+            keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
+            note::{NoteVersion, RandomSeed, Rho},
+            tree::{MerkleHashOrchard, MerklePath},
+            value::NoteValue,
+        };
+        let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes([7; 32])).unwrap();
+        let fvk = FullViewingKey::from(&sk);
+        let account = fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        let recipient = FullViewingKey::from(&Option::<SpendingKey>::from(SpendingKey::from_bytes([8; 32])).unwrap())
+            .address_at(0u32, Scope::External)
+            .to_raw_address_bytes();
+        let mut rho_bytes = [0; 32];
+        rho_bytes[0] = 3;
+        let rho = Option::<Rho>::from(Rho::from_bytes(&rho_bytes)).unwrap();
+        let mut seed_bytes = [0; 32];
+        seed_bytes[0] = 4;
+        let rseed = Option::<RandomSeed>::from(RandomSeed::from_bytes(seed_bytes, &rho)).unwrap();
+        let note = Option::<orchard::Note>::from(orchard::Note::from_parts(
+            fvk.address_at(0u32, Scope::External),
+            NoteValue::from_raw(10_000_000),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        ))
+        .unwrap();
+        let path =
+            MerklePath::from_parts(0, core::array::from_fn(|i| <MerkleHashOrchard as Hashable>::empty_root(Level::from(i as u8))));
+        let outputs = vec![PaymentOutputIntent { recipient, amount: 2_000_000, memo: [0; 512] }];
+        let genesis = [0x55; 32];
+        let payment = kaspa_shielded_core::wallet::build::prepare_payment_multi(
+            &fvk,
+            vec![(note, path)],
+            &outputs,
+            3_000_000,
+            &genesis,
+            &payment_tx_context(),
+            true,
+        )
+        .unwrap();
+        let expected = zkas_sdk::PreparedPaymentMulti {
+            version: 3,
+            network_domain: genesis,
+            tx_context: payment_tx_context(),
+            bundle: payment.effects.clone(),
+            disclosure: payment.disclosure.clone(),
+            spend_auth: payment
+                .spend_auth_requests
+                .iter()
+                .map(|(action_index, alpha)| zkas_sdk::SpendAuthRequest { action_index: *action_index, alpha: *alpha })
+                .collect(),
+            claimed_account: account,
+            claimed_outputs: outputs.clone(),
+            claimed_fee: 3_000_000,
+        };
+        let envelope = zkas_sdk::PreparedPaymentMultiEnvelope::from_typed(&expected, &SdkNetwork::Simnet).unwrap();
+        let ask = SpendAuthorizingKey::from(&sk);
+        let signatures: Vec<_> = payment
+            .spend_auth_requests
+            .iter()
+            .map(|(index, alpha)| {
+                (*index, kaspa_shielded_core::wallet::build::sign_spend_auth(&ask, *alpha, payment.sighash).unwrap())
+            })
+            .collect();
+        let intent = BatchIntent { account, outputs, max_fee: 3_000_000 };
+        let prepared = BatchPrepared {
+            payment,
+            positions: vec![0],
+            amount: 2_000_000,
+            fee: 3_000_000,
+            response: BatchPrepareResp {
+                status: "prepared",
+                logical_id: hex(&[1; 32]),
+                session: Some(hex(&[2; 24])),
+                prepared_payment: Some(envelope),
+            },
+        };
+        let mut registry = BatchRegistry::default();
+        let fvk_bytes = fvk.to_bytes();
+        let now = std::time::Instant::now();
+        registry.issue(fvk_bytes, "owner", "https://example.test", [1; 32], intent, now).unwrap();
+        registry.records.get_mut(&fvk_bytes).unwrap().phase = BatchPhase::Proving;
+        registry.finish_success(&fvk_bytes, prepared, now);
+        let bad = vec![(signatures[0].0, [0; 64])];
+        assert!(registry.begin_finalize(&fvk_bytes, "other", [1; 32], &hex(&[2; 24]), account, &genesis, &signatures, now).is_err());
+        assert!(registry.begin_finalize(&fvk_bytes, "owner", [9; 32], &hex(&[2; 24]), account, &genesis, &signatures, now).is_err());
+        assert!(registry.begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[3; 24]), account, &genesis, &signatures, now).is_err());
+        assert!(registry.begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[2; 24]), [0; 43], &genesis, &signatures, now).is_err());
+        let mut other_genesis = genesis;
+        other_genesis[0] ^= 1;
+        assert!(
+            registry.begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[2; 24]), account, &other_genesis, &signatures, now).is_err()
+        );
+        assert!(registry.begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[2; 24]), account, &genesis, &bad, now).is_err());
+        assert!(matches!(registry.records.get(&fvk_bytes).unwrap().phase, BatchPhase::Ready(_)));
+        let (prepared, intent) = match registry
+            .begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[2; 24]), account, &genesis, &signatures, now)
+            .unwrap()
+        {
+            BatchFinalizeStart::New(prepared, intent) => (*prepared, intent),
+            _ => panic!("expected one finalization"),
+        };
+        let finalized = finalize_batch_prepared(prepared, intent, signatures.clone(), [1; 32], fvk_bytes, genesis, "simnet").unwrap();
+        let bytes = hex::decode(&finalized.response.transaction_hex).unwrap();
+        let tx: Transaction = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(finalized.response.txid, hex(&tx.id().as_bytes()));
+        registry.finish_finalize(&fvk_bytes, Ok(finalized));
+        let again =
+            registry.begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[2; 24]), account, &genesis, &signatures, now).unwrap();
+        assert!(matches!(again, BatchFinalizeStart::Ready(response) if response.transaction_hex == hex(&bytes)));
     }
 }

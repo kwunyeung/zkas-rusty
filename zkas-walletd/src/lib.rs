@@ -11440,6 +11440,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/prepare", post(wallet_prepare))
         .route("/api/wallet/prepare-many/capability", post(batch_prepare::issue_batch_capability).layer(DefaultBodyLimit::max(64 * 1024)))
         .route("/api/wallet/prepare-many", post(batch_prepare::prepare_many).get(batch_prepare::prepared_many).layer(DefaultBodyLimit::max(0)))
+        .route("/api/wallet/finalize-many", post(batch_prepare::finalize_many).layer(DefaultBodyLimit::max(16 * 1024)))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
