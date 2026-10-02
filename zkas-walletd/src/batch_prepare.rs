@@ -730,6 +730,120 @@ pub(super) async fn finalized_many_journal(
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BatchDiscoveryQuery {
+    account: String,
+    genesis: String,
+    after_logical_id: Option<String>,
+    epoch: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchDiscoveryEntry {
+    logical_id: String,
+    revision: u64,
+    status: &'static str,
+    txid: String,
+    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    included_block: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    included_daa: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BatchDiscoveryResp {
+    inventory_only: bool,
+    epoch: String,
+    entries: Vec<BatchDiscoveryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_after_logical_id: Option<String>,
+    unlisted_reservation_count: usize,
+}
+
+struct DiscoveryCursor {
+    after: Option<[u8; 32]>,
+    epoch: Option<[u8; 32]>,
+}
+
+fn discovery_cursor(req: &BatchDiscoveryQuery) -> Result<DiscoveryCursor, BatchHttpError> {
+    let after = req.after_logical_id.as_deref()
+        .map(|value| lowercase_hex::<32>(value).map_err(|reason| err(StatusCode::BAD_REQUEST, reason)))
+        .transpose()?;
+    let epoch = req.epoch.as_deref()
+        .map(|value| lowercase_hex::<32>(value).map_err(|reason| err(StatusCode::BAD_REQUEST, reason)))
+        .transpose()?;
+    if after.is_some() && epoch.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "discovery cursor requires epoch"));
+    }
+    Ok(DiscoveryCursor { after, epoch })
+}
+
+fn canonical_discovery_account(value: &str) -> Result<Address, BatchHttpError> {
+    let address = Address::try_from(value).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid account"))?;
+    if address.to_string() != value {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid account"));
+    }
+    Ok(address)
+}
+
+pub(super) async fn discover_many_journal(
+    State(state): State<Arc<AppState>>, headers: HeaderMap, Query(req): Query<BatchDiscoveryQuery>,
+) -> Result<Json<BatchDiscoveryResp>, BatchHttpError> {
+    if !state.batch_journal_ready {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "payment journal migration is required"));
+    }
+    if !supported_profile(state.allow_custodial, state.enable_multiparty, &state.network) {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, "journal discovery requires a watch-only, single-owner daemon profile"));
+    }
+    if req.account.len() > 120 {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid account"));
+    }
+    let cursor = discovery_cursor(&req)?;
+    let token = token_from(&headers, false)?;
+    let wallet = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no registered wallet"))?;
+    let (fvk, account) = {
+        let entry = wallet.lock().await;
+        if !entry.key.is_watch_only() {
+            return Err(err(StatusCode::FORBIDDEN, "watch-only wallet required"));
+        }
+        (entry.db.fvk().to_bytes(), entry.db.my_address_bytes())
+    };
+    let address = canonical_discovery_account(&req.account)?;
+    if address.prefix != state.prefix || orchard_recipient_bytes(&address) != Some(account) {
+        return Err(err(StatusCode::BAD_REQUEST, "account mismatch"));
+    }
+    let genesis = lowercase_hex::<32>(&req.genesis).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))?;
+    if genesis != state.genesis.as_bytes() {
+        return Err(err(StatusCode::BAD_REQUEST, "genesis mismatch"));
+    }
+    let snapshot = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+        .discovery_snapshot(&fvk, &token, &account, &genesis)
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "journal unavailable"))?;
+    let page = snapshot.page(cursor.after, cursor.epoch).map_err(|reason| {
+        let status = if reason == "discovery inventory changed" { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+        err(status, reason)
+    })?;
+    Ok(Json(BatchDiscoveryResp {
+        inventory_only: true,
+        epoch: hex(&page.epoch),
+        entries: page.entries.into_iter().map(|entry| BatchDiscoveryEntry {
+            logical_id: hex(&entry.logical_id),
+            revision: entry.revision,
+            status: entry.status_hint(),
+            txid: hex(&entry.txid),
+            sha256: hex(&entry.sha256),
+            included_block: entry.included_block.map(|block| hex(&block)),
+            included_daa: entry.included_daa,
+        }).collect(),
+        next_after_logical_id: page.next_after.map(|cursor| hex(&cursor)),
+        unlisted_reservation_count: page.unlisted_reservation_count,
+    }))
+}
+
 pub(super) async fn legacy_uncertain(
     State(state): State<Arc<AppState>>, headers: HeaderMap,
 ) -> Result<Json<Vec<BatchSendStatus>>, BatchHttpError> {
@@ -1352,6 +1466,61 @@ async fn run_batch_job(state: Arc<AppState>, job: BatchJob) -> Result<BatchPrepa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_query_requires_bounded_cursor_and_wallet_token() {
+        let query: BatchDiscoveryQuery = serde_json::from_value(serde_json::json!({
+            "account": "zkas:example", "genesis": hex(&[7; 32]),
+            "afterLogicalId": hex(&[2; 32]), "epoch": hex(&[3; 32]),
+        })).unwrap();
+        let cursor = discovery_cursor(&query).unwrap();
+        assert_eq!(cursor.after, Some([2; 32]));
+        assert_eq!(cursor.epoch, Some([3; 32]));
+        let no_epoch = BatchDiscoveryQuery { epoch: None, ..query };
+        assert!(discovery_cursor(&no_epoch).is_err());
+        let upper = BatchDiscoveryQuery { epoch: Some("AA".repeat(32)), ..no_epoch };
+        assert!(discovery_cursor(&upper).is_err());
+        assert!(serde_json::from_value::<BatchDiscoveryQuery>(serde_json::json!({
+            "account": "zkas:example", "genesis": hex(&[7; 32]), "unknown": true,
+        })).is_err());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Batch {}", hex(&[5; 32]))).unwrap());
+        assert!(token_from(&headers, false).is_err());
+    }
+
+    #[test]
+    fn discovery_account_requires_canonical_address_text() {
+        let canonical = "zkas:pxm8d4su40hc95vr0llq7rrf5gqzhmdhh5m3c8qtve2dllfxrqrsh6wlugnyp3krnxe2cgs4fmfwagv";
+        let alias = "zkas:pxm8d4su40hc95vr0llq7rrf5gqzhmdhh5m3c8qtve2dllfxrqrsh6wlugnyp3krnxe2cg3x2zzh7md";
+        let parsed = Address::try_from(canonical).unwrap();
+        assert_eq!(Address::try_from(alias).unwrap(), parsed);
+        assert!(canonical_discovery_account(canonical).is_ok());
+        assert!(canonical_discovery_account(alias).is_err());
+    }
+
+    #[test]
+    fn discovery_response_contains_only_bounded_inventory_metadata() {
+        let response = BatchDiscoveryResp {
+            inventory_only: true,
+            epoch: hex(&[4; 32]),
+            entries: vec![BatchDiscoveryEntry {
+                logical_id: hex(&[2; 32]), revision: 2, status: "unknown", txid: hex(&[3; 32]), sha256: hex(&[5; 32]),
+                included_block: None, included_daa: None,
+            }],
+            next_after_logical_id: None,
+            unlisted_reservation_count: 1,
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["inventoryOnly"], true);
+        assert_eq!(json["unlistedReservationCount"], 1);
+        assert_eq!(json["entries"][0]["status"], "unknown");
+        assert_eq!(json["entries"][0]["revision"], 2);
+        assert!(json.get("nextAfterLogicalId").is_none());
+        let text = json.to_string();
+        for private in ["transactionHex", "origin", "intent", "positions", "memo", "fvk", "token", "account"] {
+            assert!(!text.contains(private), "exposed {private}");
+        }
+    }
 
     #[test]
     fn unavailable_history_preserves_inclusion_for_node_recovery() {

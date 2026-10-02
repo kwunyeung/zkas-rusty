@@ -11724,6 +11724,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/submit/uncertain", get(batch_prepare::legacy_uncertain))
         .route("/api/wallet/submit-many", post(batch_prepare::submit_many).layer(DefaultBodyLimit::max(2 * 1024)))
         .route("/api/wallet/submit-many/status", get(batch_prepare::status_many))
+        .route("/api/wallet/submit-many/records", get(batch_prepare::discover_many_journal))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))

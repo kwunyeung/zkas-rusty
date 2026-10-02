@@ -54,6 +54,144 @@ mod tests {
     }
 
     #[test]
+    fn discovery_pages_only_original_token_records_and_counts_every_unlisted_reservation() {
+        let dir = std::env::temp_dir().join(format!("zkas-batch-discovery-{}", rand::random::<u64>()));
+        let _cleanup = TestDir(dir.clone());
+        let genesis = [7; 32];
+        let fvk = [1; 96];
+        let account = [8; 43];
+        let mut journal = BatchJournal::open(&dir, genesis).unwrap();
+        let original = JournalRecord::new(
+            fvk, "short", genesis, account, "https://wallet.example", [0; 32], [3; 32],
+            borsh::to_vec(&payment_tx(vec![1])).unwrap(), vec![42],
+        ).unwrap();
+        for index in 0..33u8 {
+            let mut record = original.clone();
+            record.logical_id = [index; 32];
+            journal.records.insert((record.fvk_hash, record.logical_id), record);
+        }
+        let mut legacy = original.clone();
+        legacy.logical_id = [40; 32];
+        legacy.origin = "legacy".into();
+        journal.records.insert((legacy.fvk_hash, legacy.logical_id), legacy);
+        let mut foreign = original.clone();
+        foreign.logical_id = [41; 32];
+        foreign.token_hash = token_hash("older");
+        journal.records.insert((foreign.fvk_hash, foreign.logical_id), foreign);
+        let mut unrelated = original.clone();
+        unrelated.logical_id = [42; 32];
+        unrelated.fvk_hash = fvk_hash(&[2; 96]);
+        journal.records.insert((unrelated.fvk_hash, unrelated.logical_id), unrelated);
+
+        let snapshot = journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap();
+        assert_eq!(snapshot.unlisted_reservation_count, 2);
+        assert_eq!(snapshot.entries.len(), 33);
+        let first = snapshot.page(None, None).unwrap();
+        assert_eq!(first.entries.len(), 32);
+        assert_eq!(first.entries[0].logical_id, [0; 32]);
+        assert_eq!(first.next_after, Some([31; 32]));
+        let second = snapshot.page(first.next_after, Some(first.epoch)).unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].logical_id, [32; 32]);
+        assert_eq!(second.next_after, None);
+        assert_eq!(first.epoch, second.epoch);
+        assert!(snapshot.page(Some([31; 32]), None).is_err());
+        assert!(snapshot.page(Some([50; 32]), Some(first.epoch)).is_err());
+        assert!(snapshot.page(first.next_after, Some([9; 32])).is_err());
+        assert_eq!(journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().epoch, first.epoch);
+        assert_ne!(journal.discovery_snapshot(&fvk, "older", &account, &genesis).unwrap().epoch, first.epoch);
+        assert!(journal.discovery_snapshot(&fvk, "short", &[9; 43], &genesis).unwrap().entries.is_empty());
+        let new_token = journal.discovery_snapshot(&fvk, "new", &account, &genesis).unwrap();
+        assert!(new_token.entries.is_empty());
+        assert_eq!(new_token.unlisted_reservation_count, 35);
+        assert!(journal.discovery_snapshot(&fvk, "short", &account, &[6; 32]).is_err());
+        let unrelated_key = (fvk_hash(&[2; 96]), [42; 32]);
+        journal.records.get_mut(&unrelated_key).unwrap().revision += 1;
+        assert_eq!(journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().epoch, first.epoch);
+        let own_key = (fvk_hash(&fvk), [0; 32]);
+        journal.records.get_mut(&own_key).unwrap().revision += 1;
+        assert_ne!(journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().epoch, first.epoch);
+        let legacy_key = (fvk_hash(&fvk), [40; 32]);
+        journal.records.get_mut(&legacy_key).unwrap().phase = JournalPhase::Settled;
+        journal.verified_terminals.insert(legacy_key);
+        let only_foreign = journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap();
+        assert_eq!(only_foreign.unlisted_reservation_count, 1);
+        assert_ne!(only_foreign.epoch, first.epoch);
+        let foreign_key = (fvk_hash(&fvk), [41; 32]);
+        journal.records.get_mut(&foreign_key).unwrap().phase = JournalPhase::ConflictSettled;
+        journal.verified_terminals.insert(foreign_key);
+        assert_eq!(journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().unlisted_reservation_count, 0);
+        journal.poisoned = true;
+        assert!(journal.discovery_snapshot(&fvk, "short", &account, &genesis).is_err());
+    }
+
+    #[test]
+    fn discovery_epoch_is_secret_per_open_and_terminal_hints_are_conservative() {
+        let dir = std::env::temp_dir().join(format!("zkas-batch-discovery-reopen-{}", rand::random::<u64>()));
+        let _cleanup = TestDir(dir.clone());
+        let genesis = [7; 32];
+        let fvk = [1; 96];
+        let account = [8; 43];
+        let mut journal = BatchJournal::open(&dir, genesis).unwrap();
+        let record = JournalRecord::new(
+            fvk, "short", genesis, account, "https://wallet.example", [2; 32], [3; 32],
+            borsh::to_vec(&payment_tx(vec![1])).unwrap(), vec![42],
+        ).unwrap();
+        journal.insert(record).unwrap();
+        let first = journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap();
+        assert_eq!(first.entries[0].status_hint(), "finalized_unsent");
+        assert_eq!(first.epoch, journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().epoch);
+        drop(journal);
+        let mut reopened = BatchJournal::open(&dir, genesis).unwrap();
+        let second = reopened.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap();
+        assert_ne!(first.epoch, second.epoch);
+        let key = (fvk_hash(&fvk), [2; 32]);
+        let record = reopened.records.get_mut(&key).unwrap();
+        record.phase = JournalPhase::Settled;
+        let terminal = reopened.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap();
+        assert_eq!(terminal.entries[0].status_hint(), "unknown");
+        assert_ne!(terminal.epoch, second.epoch);
+        reopened.verified_terminals.insert(key);
+        assert_ne!(reopened.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().epoch, terminal.epoch);
+        reopened.records.get_mut(&key).unwrap().phase = JournalPhase::ConflictSettled;
+        assert_eq!(reopened.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap().entries[0].status_hint(), "conflicted");
+    }
+
+    #[test]
+    fn discovery_pages_cover_full_record_bound_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("zkas-batch-discovery-bound-{}", rand::random::<u64>()));
+        let _cleanup = TestDir(dir.clone());
+        let genesis = [7; 32];
+        let fvk = [1; 96];
+        let account = [8; 43];
+        let mut journal = BatchJournal::open(&dir, genesis).unwrap();
+        let original = JournalRecord::new(
+            fvk, "short", genesis, account, "https://wallet.example", [0; 32], [3; 32],
+            borsh::to_vec(&payment_tx(vec![1])).unwrap(), vec![42],
+        ).unwrap();
+        for index in 0..MAX_RECORDS {
+            let mut record = original.clone();
+            record.logical_id[..4].copy_from_slice(&(index as u32).to_be_bytes());
+            journal.records.insert((record.fvk_hash, record.logical_id), record);
+        }
+        let snapshot = journal.discovery_snapshot(&fvk, "short", &account, &genesis).unwrap();
+        assert_eq!(snapshot.entries.len(), MAX_RECORDS);
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = snapshot.page(cursor, cursor.map(|_| snapshot.epoch)).unwrap();
+            assert!(!page.entries.is_empty());
+            assert!(page.entries.len() <= DISCOVERY_PAGE_SIZE);
+            seen.extend(page.entries.iter().map(|entry| entry.logical_id));
+            cursor = page.next_after;
+            if cursor.is_none() { break; }
+        }
+        assert_eq!(seen.len(), MAX_RECORDS);
+        assert_eq!(seen, snapshot.entries.iter().map(|entry| entry.logical_id).collect::<Vec<_>>());
+        assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
     fn selected_chain_page_requires_parallel_acceptance_ids_and_reverts_on_reorg() {
         let tx = payment_tx(vec![1]);
         let record = JournalRecord::new(
@@ -258,6 +396,7 @@ mod tests {
 // Durable identity and exact bytes for submitted watch-only payments.
 
 use super::*;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -269,6 +408,63 @@ use std::{
 
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
+const DISCOVERY_PAGE_SIZE: usize = 32;
+
+#[derive(Clone)]
+pub(super) struct DiscoveryEntry {
+    pub logical_id: [u8; 32],
+    pub revision: u64,
+    pub txid: [u8; 32],
+    pub sha256: [u8; 32],
+    pub included_block: Option<[u8; 32]>,
+    pub included_daa: Option<u64>,
+    phase: JournalPhase,
+}
+
+impl DiscoveryEntry {
+    pub(super) fn status_hint(&self) -> &'static str {
+        match self.phase {
+            JournalPhase::Finalized => "finalized_unsent",
+            JournalPhase::Unknown | JournalPhase::Settled => "unknown",
+            JournalPhase::Mempool => "mempool",
+            JournalPhase::Included => "included",
+            JournalPhase::Conflicted | JournalPhase::ConflictSettled => "conflicted",
+        }
+    }
+}
+
+pub(super) struct DiscoverySnapshot {
+    pub epoch: [u8; 32],
+    pub entries: Vec<DiscoveryEntry>,
+    pub unlisted_reservation_count: usize,
+}
+
+pub(super) struct DiscoveryPage {
+    pub epoch: [u8; 32],
+    pub entries: Vec<DiscoveryEntry>,
+    pub next_after: Option<[u8; 32]>,
+    pub unlisted_reservation_count: usize,
+}
+
+impl DiscoverySnapshot {
+    pub(super) fn page(&self, after: Option<[u8; 32]>, expected_epoch: Option<[u8; 32]>) -> Result<DiscoveryPage, &'static str> {
+        if after.is_some() && expected_epoch.is_none() {
+            return Err("discovery cursor requires epoch");
+        }
+        if expected_epoch.is_some_and(|epoch| epoch != self.epoch) {
+            return Err("discovery inventory changed");
+        }
+        let start = match after {
+            Some(cursor) => self.entries.iter().position(|entry| entry.logical_id == cursor)
+                .map(|index| index + 1).ok_or("unknown discovery cursor")?,
+            None => 0,
+        };
+        let end = start.saturating_add(DISCOVERY_PAGE_SIZE).min(self.entries.len());
+        let entries = self.entries[start..end].to_vec();
+        let next_after = if end < self.entries.len() { entries.last().map(|entry| entry.logical_id) } else { None };
+        Ok(DiscoveryPage { epoch: self.epoch, entries, next_after, unlisted_reservation_count: self.unlisted_reservation_count })
+    }
+}
 
 pub(super) fn verify_private_wallet_dir(dir: &Path, newly_created: bool) -> Result<(), String> {
     let metadata = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
@@ -402,6 +598,20 @@ pub(super) enum JournalPhase {
     Settled,
     Conflicted,
     ConflictSettled,
+}
+
+impl JournalPhase {
+    fn epoch_code(self) -> u8 {
+        match self {
+            Self::Finalized => 0,
+            Self::Unknown => 1,
+            Self::Mempool => 2,
+            Self::Included => 3,
+            Self::Settled => 4,
+            Self::Conflicted => 5,
+            Self::ConflictSettled => 6,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,6 +773,7 @@ pub(super) struct BatchJournal {
     anchor: PathBuf,
     _lock: File,
     genesis: [u8; 32],
+    epoch_key: [u8; 32],
     records: HashMap<([u8; 32], [u8; 32]), JournalRecord>,
     verified_terminals: HashSet<([u8; 32], [u8; 32])>,
     poisoned: bool,
@@ -607,11 +818,15 @@ impl BatchJournal {
         if !existed {
             File::open(parent).and_then(|file| file.sync_all()).map_err(|e| e.to_string())?;
         }
+        let mut epoch_key = [0u8; 32];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut epoch_key);
         let mut journal = Self {
             dir: dir.to_owned(),
             anchor,
             _lock: lock,
             genesis,
+            epoch_key,
             records: HashMap::new(),
             verified_terminals: HashSet::new(),
             poisoned: false,
@@ -770,6 +985,50 @@ impl BatchJournal {
             .filter(|(key, record)| record.fvk_hash == fingerprint && (record.reserves() || !self.verified_terminals.contains(key)))
             .map(|(_, record)| record.clone())
             .collect()
+    }
+
+    pub(super) fn discovery_snapshot(
+        &self, fvk: &[u8; 96], token: &str, account: &[u8; 43], genesis: &[u8; 32],
+    ) -> Result<DiscoverySnapshot, &'static str> {
+        if self.poisoned || genesis != &self.genesis {
+            return Err("payment journal unavailable");
+        }
+        let fingerprint = fvk_hash(fvk);
+        let mut readable: Vec<_> = self.records.iter()
+            .filter(|((owner, _), record)| owner == &fingerprint && record.origin != "legacy" && record.authenticate(token, account, genesis))
+            .collect();
+        readable.sort_by_key(|((_, logical_id), _)| *logical_id);
+        let unlisted_reservation_count = self.records.iter().filter(|(key, record)| {
+            key.0 == fingerprint
+                && (record.reserves() || !self.verified_terminals.contains(key))
+                && (record.origin == "legacy" || !record.authenticate(token, account, genesis))
+        }).count();
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.epoch_key).map_err(|_| "payment journal unavailable")?;
+        mac.update(b"zkas.walletd.batch.discovery.epoch.v1");
+        mac.update(genesis);
+        mac.update(&fingerprint);
+        mac.update(&token_hash(token));
+        mac.update(account);
+        mac.update(&(readable.len() as u64).to_le_bytes());
+        let mut entries = Vec::with_capacity(readable.len());
+        for (key, record) in readable {
+            let verified_terminal = self.verified_terminals.contains(key);
+            mac.update(&record.logical_id);
+            mac.update(&record.revision.to_le_bytes());
+            mac.update(&[record.phase.epoch_code(), u8::from(verified_terminal)]);
+            entries.push(DiscoveryEntry {
+                logical_id: record.logical_id,
+                revision: record.revision,
+                txid: record.txid,
+                sha256: record.sha256,
+                included_block: if matches!(record.phase, JournalPhase::Settled | JournalPhase::ConflictSettled) { None } else { record.included_block },
+                included_daa: if matches!(record.phase, JournalPhase::Settled | JournalPhase::ConflictSettled) { None } else { record.included_daa },
+                phase: record.phase,
+            });
+        }
+        mac.update(&(unlisted_reservation_count as u64).to_le_bytes());
+        let epoch = mac.finalize().into_bytes().into();
+        Ok(DiscoverySnapshot { epoch, entries, unlisted_reservation_count })
     }
 
     pub(super) fn begin_attempt(
