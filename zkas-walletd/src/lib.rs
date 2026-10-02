@@ -46,6 +46,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 mod diagnostics;
+mod chain_history;
 use diagnostics::{io_error_category, join_error_category, json_error_category, session_diag_id, wallet_diag_id};
 
 pub mod selfhost;
@@ -4398,6 +4399,10 @@ struct NodeClients {
 }
 
 struct AppState {
+    /// Independent bounded channel for selected public shielded history reads.
+    history_client: std::sync::Arc<tokio::sync::RwLock<Option<chain_history::HistoryConnection>>>,
+    history_retire: std::sync::Arc<chain_history::HistoryRetire>,
+    history_gate: tokio::sync::Semaphore,
     /// gRPC connection for the REQUEST path — wallet loads, the tip ticker, prepare /
     /// submit. Kept separate from `sync_client` so the background sync loop's continuous
     /// block-fetch traffic can't make a user's wallet load (which needs a couple of node
@@ -11429,6 +11434,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // already copes with not having them.
     let node_clients: std::sync::Arc<tokio::sync::RwLock<Option<NodeClients>>> = Default::default();
     let node_error: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let history_client: std::sync::Arc<tokio::sync::RwLock<Option<chain_history::HistoryConnection>>> = Default::default();
+    let history_retire = std::sync::Arc::new(chain_history::HistoryRetire::default());
+    let history_supervisor = chain_history::start_supervisor(history_client.clone(), history_retire.clone(), cfg.rpc_server.clone());
     let connector_task = {
         let rpc_server = cfg.rpc_server.clone();
         let slot = node_clients.clone();
@@ -11482,6 +11490,9 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         enable_multiparty: cfg.enable_multiparty,
         bundles: Mutex::new(HashMap::new()),
         clients: node_clients.clone(),
+        history_client,
+        history_retire,
+        history_gate: tokio::sync::Semaphore::new(2),
         node_error: node_error.clone(),
         chain_tree: chain_tree.clone(),
         chain_tree_size: std::sync::atomic::AtomicU64::new(0),
@@ -11700,6 +11711,7 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/status", get(status))
+        .route("/api/chain/shielded-history", get(chain_history::shielded_history).layer(DefaultBodyLimit::max(0)))
         .route("/api/checkpoint", post(checkpoint))
         .route("/api/wallet/create", post(wallet_create))
         .route("/api/wallet/import", post(wallet_import))
@@ -11881,6 +11893,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     mempool_task.abort();
     tip_task.abort();
     connector_task.abort();
+    history_supervisor.stop();
+    history_supervisor.drain().await;
     consolidate_task.abort();
     warm_sweep_task.abort();
     flush_checkpoints_on_exit(&state).await;
