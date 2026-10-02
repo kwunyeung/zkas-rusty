@@ -126,6 +126,88 @@ fn finalized_v3_requires_exact_prepared_handle_and_actual_signatures() {
 }
 
 #[test]
+fn private_signed_ticket_restores_original_signatures_and_full_finalized_verifier() {
+    let data = finalized_fixture();
+    let prepared = data["preparedEnvelope"].to_string();
+    let mut original = new_signer(&data, data["genesisHex"].as_str().unwrap());
+    assert!(original.export_signed_v3_ticket().is_err());
+    let original_signatures = original.sign_prepared_v3(&prepared).unwrap();
+    let ticket = original.export_signed_v3_ticket().unwrap();
+    assert!(!ticket.contains(data["provenance"]["accountSeedHex"].as_str().unwrap()));
+    let signatures: Vec<Value> = serde_json::from_str(&original_signatures).unwrap();
+    let exact = finalized_for_signatures(&data, &signatures);
+
+    let mut restored = new_signer(&data, data["genesisHex"].as_str().unwrap());
+    assert!(restored.verify_finalized_v3(&exact).is_err());
+    restored.import_signed_v3_ticket(&ticket).unwrap();
+    assert_eq!(restored.sign_prepared_v3(&prepared).unwrap(), original_signatures);
+    assert!(restored.sign_prepared_v3(&fixture()["preparedEnvelope"].to_string()).is_err());
+    let recovered: Value = serde_json::from_str(&restored.verify_finalized_v3(&exact).unwrap()).unwrap();
+    assert_eq!(recovered["transactionHex"], exact);
+    assert_eq!(restored.export_signed_v3_ticket().unwrap(), ticket);
+    assert!(restored.verify_finalized_v3(data["transactionHex"].as_str().unwrap()).is_err());
+    assert!(restored.import_signed_v3_ticket(&ticket).is_err());
+}
+
+#[test]
+fn private_signed_ticket_rejects_changed_context_partial_or_invalid_signature_map() {
+    let data = finalized_fixture();
+    let mut original = new_signer(&data, data["genesisHex"].as_str().unwrap());
+    let original_signatures = original.sign_prepared_v3(&data["preparedEnvelope"].to_string()).unwrap();
+    let ticket = original.export_signed_v3_ticket().unwrap();
+
+    let mut wrong_genesis = new_signer(&data, &"56".repeat(32));
+    assert!(wrong_genesis.import_signed_v3_ticket(&ticket).is_err());
+    let mut wrong_approval = data.clone();
+    wrong_approval["approvedIntent"]["maxFeeSompi"] = Value::String("2999999".into());
+    let mut wrong_approval = new_signer(&wrong_approval, data["genesisHex"].as_str().unwrap());
+    assert!(wrong_approval.import_signed_v3_ticket(&ticket).is_err());
+    let mut wider_approval = data.clone();
+    wider_approval["approvedIntent"]["maxFeeSompi"] = Value::String("4000000".into());
+    let mut wider_approval = new_signer(&wider_approval, data["genesisHex"].as_str().unwrap());
+    assert!(wider_approval.import_signed_v3_ticket(&ticket).is_err());
+
+    let signatures: Vec<Value> = serde_json::from_str(&original_signatures).unwrap();
+    let signature_hex = signatures[0]["signatureHex"].as_str().unwrap();
+    let mut invalid = signature_hex.to_string();
+    invalid.replace_range(0..2, if &invalid[..2] == "00" { "01" } else { "00" });
+    let changed = ticket.replacen(signature_hex, &invalid, 1);
+    let mut restored = new_signer(&data, data["genesisHex"].as_str().unwrap());
+    assert!(restored.import_signed_v3_ticket(&changed).is_err());
+    assert!(restored.verify_finalized_v3(data["transactionHex"].as_str().unwrap()).is_err());
+
+    let mut partial: Value = serde_json::from_str(&ticket).unwrap();
+    partial["signatures"] = Value::Array(vec![]);
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&partial.to_string()).is_err());
+    let mut duplicated: Value = serde_json::from_str(&ticket).unwrap();
+    duplicated["signatures"] = Value::Array(vec![signatures[0].clone(), signatures[0].clone()]);
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&duplicated.to_string()).is_err());
+    let mut unknown: Value = serde_json::from_str(&ticket).unwrap();
+    unknown["seed"] = Value::String("not allowed".into());
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&unknown.to_string()).is_err());
+    let mut unknown_nested: Value = serde_json::from_str(&ticket).unwrap();
+    unknown_nested["prepared"]["unapproved"] = Value::Bool(true);
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&unknown_nested.to_string()).is_err());
+    let duplicated_field = ticket.replacen("\"version\":1,", "\"version\":1,\"version\":1,", 1);
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&duplicated_field).is_err());
+    let mut wrong_version: Value = serde_json::from_str(&ticket).unwrap();
+    wrong_version["version"] = Value::from(2);
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&wrong_version.to_string()).is_err());
+    let mut wrong_format: Value = serde_json::from_str(&ticket).unwrap();
+    wrong_format["format"] = Value::String("unknown".into());
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&wrong_format.to_string()).is_err());
+    let mut wrong_digest: Value = serde_json::from_str(&ticket).unwrap();
+    wrong_digest["approvalDigest"] = Value::String("00".repeat(32));
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&wrong_digest.to_string()).is_err());
+    let noncanonical = ticket.replace("\"version\":1,", "\"version\": 1,");
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&noncanonical).is_err());
+    let mut already_signed = new_signer(&data, data["genesisHex"].as_str().unwrap());
+    already_signed.sign_prepared_v3(&data["preparedEnvelope"].to_string()).unwrap();
+    assert!(already_signed.import_signed_v3_ticket(&ticket).is_err());
+    assert!(new_signer(&data, data["genesisHex"].as_str().unwrap()).import_signed_v3_ticket(&"x".repeat(640 * 1024 + 1)).is_err());
+}
+
+#[test]
 fn finalized_v3_rejects_corrupted_proof_authorizations_and_borsh_shape() {
     use kaspa_consensus_core::tx::Transaction;
     let data = finalized_fixture();

@@ -13,7 +13,10 @@ use kaspa_shielded_core::{
     verify::sighash,
     wallet::address_bytes_from_seed,
 };
-use orchard::keys::FullViewingKey;
+use orchard::{
+    keys::FullViewingKey,
+    primitives::redpallas::{Signature, SpendAuth, VerificationKey},
+};
 use zeroize::Zeroizing;
 use zkas_wallet_engine::payment::{
     STANDARD_TX_MASS_CAP, TRANSIENT_BYTE_TO_MASS_FACTOR, TX_ENVELOPE_MARGIN, max_actions_per_tx, min_relay_fee_for_actions,
@@ -161,6 +164,9 @@ pub enum SignerError {
         action_index: usize,
     },
     IncompleteSpendAuthorization,
+    InvalidImportedSignature {
+        action_index: usize,
+    },
 }
 
 impl core::fmt::Display for SignerError {
@@ -190,6 +196,7 @@ impl core::fmt::Display for SignerError {
             Self::InvalidPaymentContext => f.write_str("prepared bundle has a noncanonical payment transaction context"),
             Self::InvalidActionKey { action_index } => write!(f, "action {action_index} is not authorized by this wallet key"),
             Self::IncompleteSpendAuthorization => f.write_str("spend authorization requests do not cover exactly the real spends"),
+            Self::InvalidImportedSignature { action_index } => write!(f, "action {action_index} has an invalid retained signature"),
         }
     }
 }
@@ -291,6 +298,49 @@ impl SoftwareSigner {
         intent: &BatchIntent,
         prepared: &PreparedPaymentMulti,
     ) -> Result<Vec<DeviceSignature>, SignerError> {
+        let message = self.verify_multi_prepared(expected_network, intent, prepared)?;
+        prepared
+            .spend_auth
+            .iter()
+            .map(|request| {
+                let signature = sign_spend_auth_from_seed(*self.seed, request.alpha, message)
+                    .ok_or(SignerError::InvalidSpendRandomizer { action_index: request.action_index })?;
+                Ok(DeviceSignature { action_index: request.action_index, signature })
+            })
+            .collect()
+    }
+
+    /// Recheck a retained authorization without creating new signatures. The
+    /// caller must keep the prepared payment and signatures inside wallet storage.
+    pub fn verify_signed_multi(
+        &self,
+        expected_network: &[u8; 32],
+        intent: &BatchIntent,
+        prepared: &PreparedPaymentMulti,
+        signatures: &[DeviceSignature],
+    ) -> Result<(), SignerError> {
+        let message = self.verify_multi_prepared(expected_network, intent, prepared)?;
+        if signatures.len() != prepared.spend_auth.len() {
+            return Err(SignerError::IncompleteSpendAuthorization);
+        }
+        for (request, retained) in prepared.spend_auth.iter().zip(signatures) {
+            if retained.action_index != request.action_index {
+                return Err(SignerError::IncompleteSpendAuthorization);
+            }
+            let key = VerificationKey::<SpendAuth>::try_from(prepared.bundle.actions[request.action_index].rk)
+                .map_err(|_| SignerError::InvalidImportedSignature { action_index: request.action_index })?;
+            key.verify(&message, &Signature::<SpendAuth>::from(retained.signature))
+                .map_err(|_| SignerError::InvalidImportedSignature { action_index: request.action_index })?;
+        }
+        Ok(())
+    }
+
+    fn verify_multi_prepared(
+        &self,
+        expected_network: &[u8; 32],
+        intent: &BatchIntent,
+        prepared: &PreparedPaymentMulti,
+    ) -> Result<[u8; 32], SignerError> {
         if prepared.version != PreparedPaymentMulti::VERSION {
             return Err(SignerError::UnsupportedPreparedVersion(prepared.version));
         }
@@ -360,16 +410,7 @@ impl SoftwareSigner {
         if real.iter().any(|&i| !seen[i]) {
             return Err(SignerError::IncompleteSpendAuthorization);
         }
-        let message = sighash(&prepared.bundle, expected_network, &PAYMENT_TX_CONTEXT);
-        prepared
-            .spend_auth
-            .iter()
-            .map(|request| {
-                let signature = sign_spend_auth_from_seed(*self.seed, request.alpha, message)
-                    .ok_or(SignerError::InvalidSpendRandomizer { action_index: request.action_index })?;
-                Ok(DeviceSignature { action_index: request.action_index, signature })
-            })
-            .collect()
+        Ok(sighash(&prepared.bundle, expected_network, &PAYMENT_TX_CONTEXT))
     }
 }
 
@@ -517,6 +558,17 @@ mod tests {
         assert!(matches!(signer.verify_and_sign_multi(&network, &approved, &wrong), Err(SignerError::IncompleteSpendAuthorization)));
         let signatures = signer.verify_and_sign_multi(&network, &approved, &prepared).unwrap();
         assert_eq!(signatures.len(), 1);
+        signer.verify_signed_multi(&network, &approved, &prepared, &signatures).unwrap();
+        let mut invalid_signature = signatures.clone();
+        invalid_signature[0].signature[0] ^= 1;
+        assert!(matches!(
+            signer.verify_signed_multi(&network, &approved, &prepared, &invalid_signature),
+            Err(SignerError::InvalidImportedSignature { .. })
+        ));
+        assert!(matches!(
+            signer.verify_signed_multi(&network, &approved, &prepared, &[]),
+            Err(SignerError::IncompleteSpendAuthorization)
+        ));
         let finalized = finalize_payment_multi(core, signatures.into_iter().map(|s| (s.action_index, s.signature)).collect()).unwrap();
         let sighash = sighash(&finalized, &network, &PAYMENT_TX_CONTEXT);
         kaspa_shielded_core::verify::verify_bundle(&finalized, &sighash).unwrap();

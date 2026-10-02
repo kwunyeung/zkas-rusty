@@ -69,7 +69,10 @@ const finalSigner = new PrivateAccountSigner(finalSeed, "mainnet", finalizedFixt
 assert.ok(finalSeed.every(byte => byte === 0));
 assert.throws(() => finalSigner.verify_finalized_v3(finalizedFixture.transactionHex));
 const finalPrepared = JSON.stringify(finalizedFixture.preparedEnvelope);
+assert.throws(() => finalSigner.export_signed_v3_ticket());
 const finalSignatures = finalSigner.sign_prepared_v3(finalPrepared);
+const signedTicket = finalSigner.export_signed_v3_ticket();
+assert.equal(JSON.parse(signedTicket).format, "zkas-private-signed-payment");
 assert.equal(finalSigner.sign_prepared_v3(finalPrepared), finalSignatures);
 assert.throws(() => finalSigner.sign_prepared_v3(prepared));
 const repo = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -77,6 +80,35 @@ function finalized(signatures, mode = "valid") {
     return execFileSync("cargo", ["run", "--offline", "--locked", "--quiet", "-p", "zkas-browser-signer", "--example", "finalize_v3_fixture", "--", signatures, mode], { cwd: repo, encoding: "utf8" }).trim();
 }
 const exact = finalized(finalSignatures);
+function restoreFinal(intent = finalizedFixture.approvedIntent, genesis = finalizedFixture.genesisHex) {
+    const seed = Uint8Array.from(Buffer.from(finalizedFixture.provenance.accountSeedHex, "hex"));
+    const handle = new PrivateAccountSigner(seed, "mainnet", genesis, JSON.stringify(intent));
+    assert.ok(seed.every(byte => byte === 0));
+    return handle;
+}
+const recovered = restoreFinal();
+assert.throws(() => recovered.verify_finalized_v3(exact));
+recovered.import_signed_v3_ticket(signedTicket);
+assert.equal(recovered.export_signed_v3_ticket(), signedTicket);
+assert.equal(recovered.sign_prepared_v3(finalPrepared), finalSignatures);
+assert.throws(() => recovered.sign_prepared_v3(prepared));
+assert.equal(JSON.parse(recovered.verify_finalized_v3(exact)).transactionHex, exact);
+assert.throws(() => recovered.verify_finalized_v3(finalizedFixture.transactionHex));
+assert.throws(() => recovered.import_signed_v3_ticket(signedTicket));
+recovered.free();
+const badGenesisRecovery = restoreFinal(finalizedFixture.approvedIntent, "56".repeat(32));
+assert.throws(() => badGenesisRecovery.import_signed_v3_ticket(signedTicket));
+badGenesisRecovery.free();
+const originalHex = JSON.parse(finalSignatures)[0].signatureHex;
+const corruptedHex = (originalHex.startsWith("00") ? "01" : "00") + originalHex.slice(2);
+const corruptedTicket = signedTicket.replace(originalHex, corruptedHex);
+const badSignatureRecovery = restoreFinal();
+assert.throws(() => badSignatureRecovery.import_signed_v3_ticket(corruptedTicket));
+assert.throws(() => badSignatureRecovery.verify_finalized_v3(exact));
+badSignatureRecovery.free();
+const partialRecovery = restoreFinal();
+assert.throws(() => partialRecovery.import_signed_v3_ticket(signedTicket.replace(/"signatures":\[[^\]]+\]/, '"signatures":[]')));
+partialRecovery.free();
 const verified = JSON.parse(finalSigner.verify_finalized_v3(exact));
 assert.equal(verified.transactionHex, exact);
 assert.match(verified.txid, /^[0-9a-f]{64}$/);
