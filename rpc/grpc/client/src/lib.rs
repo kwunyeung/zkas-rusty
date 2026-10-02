@@ -41,6 +41,7 @@ use kaspa_utils_tower::{
     middleware::{CountBytesBody, MapRequestBodyLayer, MapResponseBodyLayer, ServiceBuilder},
 };
 use regex::Regex;
+use std::sync::RwLock;
 use std::{
     sync::{
         Arc,
@@ -51,7 +52,6 @@ use std::{
 use tokio::sync::Mutex;
 use tonic::Streaming;
 use tonic::codec::CompressionEncoding;
-use std::sync::RwLock;
 
 /// A SOCKS5 proxy (host:port) to reach the gRPC server through. The on-device wallet
 /// engine sets this to Orbot for Tor mode; the node and hosted daemon leave it None,
@@ -167,6 +167,38 @@ impl GrpcClient {
         timeout_duration: Option<u64>,
         counters: Arc<TowerConnectionCounters>,
     ) -> Result<GrpcClient> {
+        Self::connect_with_args_and_receive_limit(
+            notification_mode,
+            url,
+            subscription_context,
+            reconnect,
+            connection_event_sender,
+            override_handle_stop_notify,
+            timeout_duration,
+            counters,
+            None,
+        )
+        .await
+    }
+
+    /// Connects with an optional decoded gRPC response limit in bytes.
+    /// `None` retains the existing default; the limit cannot exceed that default.
+    /// `timeout_duration` remains a request timeout in milliseconds.
+    pub async fn connect_with_args_and_receive_limit(
+        notification_mode: NotificationMode,
+        url: String,
+        subscription_context: Option<SubscriptionContext>,
+        reconnect: bool,
+        connection_event_sender: Option<Sender<ConnectionEvent>>,
+        override_handle_stop_notify: bool,
+        timeout_duration: Option<u64>,
+        counters: Arc<TowerConnectionCounters>,
+        receive_limit_bytes: Option<usize>,
+    ) -> Result<GrpcClient> {
+        let max_decoding_message_size = receive_limit_bytes.unwrap_or(RPC_MAX_MESSAGE_SIZE);
+        if max_decoding_message_size == 0 || max_decoding_message_size > RPC_MAX_MESSAGE_SIZE {
+            return Err(Error::String("invalid gRPC receive limit".to_string()));
+        }
         let schema = Regex::new(r"^grpc://").unwrap();
         if !schema.is_match(&url) {
             return Err(Error::GrpcAddressSchema(url));
@@ -176,6 +208,7 @@ impl GrpcClient {
             connection_event_sender,
             override_handle_stop_notify,
             timeout_duration.unwrap_or(REQUEST_TIMEOUT_DURATION),
+            max_decoding_message_size,
             counters,
         )
         .await?;
@@ -477,6 +510,7 @@ struct Inner {
     timeout_shutdown: DuplexTrigger,
     timeout_timer_interval: u64,
     timeout_duration: u64,
+    max_decoding_message_size: usize,
 
     // Connection monitor allowing to reconnect automatically to the server
     connector_is_running: AtomicBool,
@@ -502,6 +536,7 @@ impl Inner {
         connection_event_sender: Option<Sender<ConnectionEvent>>,
         override_handle_stop_notify: bool,
         timeout_duration: u64,
+        max_decoding_message_size: usize,
         counters: Arc<TowerConnectionCounters>,
     ) -> Self {
         let resolver: DynResolver = match server_features.handle_message_id {
@@ -521,6 +556,7 @@ impl Inner {
             timeout_is_running: AtomicBool::new(false),
             timeout_shutdown: DuplexTrigger::new(),
             timeout_duration,
+            max_decoding_message_size,
             timeout_timer_interval: TIMEOUT_MONITORING_INTERVAL,
             connector_is_running: AtomicBool::new(false),
             connector_shutdown: DuplexTrigger::new(),
@@ -537,15 +573,22 @@ impl Inner {
         connection_event_sender: Option<Sender<ConnectionEvent>>,
         override_handle_stop_notify: bool,
         timeout_duration: u64,
+        max_decoding_message_size: usize,
         counters: Arc<TowerConnectionCounters>,
     ) -> Result<Arc<Self>> {
         // Request channel
         let (request_sender, request_receiver) = async_channel::unbounded();
 
         // Try to connect to the server
-        let (stream, server_features) =
-            Inner::try_connect(url.clone(), request_sender.clone(), request_receiver.clone(), timeout_duration, counters.clone())
-                .await?;
+        let (stream, server_features) = Inner::try_connect(
+            url.clone(),
+            request_sender.clone(),
+            request_receiver.clone(),
+            timeout_duration,
+            max_decoding_message_size,
+            counters.clone(),
+        )
+        .await?;
 
         // create the inner object
         let inner = Arc::new(Inner::new(
@@ -556,6 +599,7 @@ impl Inner {
             connection_event_sender,
             override_handle_stop_notify,
             timeout_duration,
+            max_decoding_message_size,
             counters,
         ));
 
@@ -575,6 +619,7 @@ impl Inner {
         request_sender: KaspadRequestSender,
         request_receiver: KaspadRequestReceiver,
         request_timeout: u64,
+        max_decoding_message_size: usize,
         counters: Arc<TowerConnectionCounters>,
     ) -> Result<(Streaming<KaspadResponse>, ServerFeatures)> {
         // gRPC endpoint
@@ -604,7 +649,7 @@ impl Inner {
         client = client
             .send_compressed(CompressionEncoding::Gzip)
             .accept_compressed(CompressionEncoding::Gzip)
-            .max_decoding_message_size(RPC_MAX_MESSAGE_SIZE);
+            .max_decoding_message_size(max_decoding_message_size);
 
         // Prepare a request receiver stream
         let stream_receiver = request_receiver.clone();
@@ -657,6 +702,7 @@ impl Inner {
             self.request_sender.clone(),
             self.request_receiver.clone(),
             self.timeout_duration,
+            self.max_decoding_message_size,
             self.counters.clone(),
         )
         .await?;
