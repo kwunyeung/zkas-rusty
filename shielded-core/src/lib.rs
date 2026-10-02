@@ -30,6 +30,7 @@ pub mod bundle;
 pub mod burn;
 pub mod coinbase;
 pub mod commitment;
+pub mod full_memo;
 pub mod message;
 pub mod nullifier;
 pub mod payment_check;
