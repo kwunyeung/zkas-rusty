@@ -20,7 +20,9 @@ workspace = true
 zkas-sdk.workspace = true
 zkas-signer.workspace = true
 zkas-wallet-engine.workspace = true
-kaspa-shielded-core.workspace = true
+kaspa-shielded-core = { workspace = true, features = ["browser-verifier"] }
+kaspa-hashes.workspace = true
+sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 hex.workspace = true
@@ -31,6 +33,10 @@ zeroize.workspace = true
 getrandom = { version = "=0.4.2", features = ["wasm_js"] }
 
 [dev-dependencies]
+kaspa-consensus-core.workspace = true
+kaspa-shielded-wallet.workspace = true
+borsh.workspace = true
+sha2.workspace = true
 kaspa-shielded-core = { workspace = true, features = ["circuit"] }
 incrementalmerkletree = { version = "=0.8.2", features = ["legacy-api"] }
 orchard = { package = "zakura-orchard", version = "=1.0.1", default-features = false, features = ["std", "weighted-merkle"] }

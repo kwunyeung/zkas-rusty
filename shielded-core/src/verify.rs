@@ -113,7 +113,7 @@ pub fn sighash(bundle: &ShieldedBundle, network_domain: &[u8; 32], tx_context: &
     out
 }
 
-#[cfg(feature = "circuit")]
+#[cfg(any(feature = "circuit", feature = "browser-verifier"))]
 mod circuit_verify {
     use super::*;
     use group::{Group, GroupEncoding};
@@ -283,7 +283,7 @@ mod circuit_verify {
     }
 }
 
-#[cfg(feature = "circuit")]
+#[cfg(any(feature = "circuit", feature = "browser-verifier"))]
 pub use circuit_verify::{verify_bundle, verify_bundle_with_vk, verify_bundles_batched, verifying_key};
 
 /// Gold-standard end-to-end validation of the cryptographic verifier: build a
@@ -503,7 +503,7 @@ pub const BUNDLE_VERSION: orchard::bundle::BundleVersion = orchard::bundle::Bund
 /// anchored-base circuit of halo2_gadgets 0.5.0 / orchard 0.14.0 — the circuit every proof on
 /// the live chain has been verified against. `PostNu6_3` adds a constrained public input and is
 /// a DIFFERENT circuit: changing this constant is a hard fork.
-#[cfg(feature = "circuit")]
+#[cfg(any(feature = "circuit", feature = "browser-verifier"))]
 pub const CIRCUIT_VERSION: orchard::circuit::OrchardCircuitVersion = orchard::circuit::OrchardCircuitVersion::FixedPostNu6_2;
 
 /// The Orchard crate this build links, as `name version sha256` read from the
@@ -518,9 +518,9 @@ pub const HALO2_GADGETS_CRATE: &str = env!("ZKAS_HALO2_GADGETS_CRATE");
 /// One line identifying the shielded circuit this node verifies against.
 /// Intended for the startup log and for `getInfo`-style RPC exposure.
 pub fn circuit_identity() -> String {
-    #[cfg(feature = "circuit")]
+    #[cfg(any(feature = "circuit", feature = "browser-verifier"))]
     let version = format!("{CIRCUIT_VERSION:?}");
-    #[cfg(not(feature = "circuit"))]
+    #[cfg(not(any(feature = "circuit", feature = "browser-verifier")))]
     let version = "no-circuit-feature".to_string();
     format!("circuit={version} orchard=[{ORCHARD_CRATE}] halo2_gadgets=[{HALO2_GADGETS_CRATE}]")
 }

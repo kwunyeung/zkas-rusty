@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -59,3 +61,46 @@ for (const [network, intent] of [
 }
 
 console.log("browser signer WASM: verified signatures, seed clearing, and negative parity cases");
+
+
+const finalizedFixture = JSON.parse(readFileSync(new URL("./fixtures/v3-finalized.json", import.meta.url)));
+const finalSeed = Uint8Array.from(Buffer.from(finalizedFixture.provenance.accountSeedHex, "hex"));
+const finalSigner = new PrivateAccountSigner(finalSeed, "mainnet", finalizedFixture.genesisHex, JSON.stringify(finalizedFixture.approvedIntent));
+assert.ok(finalSeed.every(byte => byte === 0));
+assert.throws(() => finalSigner.verify_finalized_v3(finalizedFixture.transactionHex));
+const finalPrepared = JSON.stringify(finalizedFixture.preparedEnvelope);
+const finalSignatures = finalSigner.sign_prepared_v3(finalPrepared);
+assert.equal(finalSigner.sign_prepared_v3(finalPrepared), finalSignatures);
+assert.throws(() => finalSigner.sign_prepared_v3(prepared));
+const repo = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
+function finalized(signatures, mode = "valid") {
+    return execFileSync("cargo", ["run", "--offline", "--locked", "--quiet", "-p", "zkas-browser-signer", "--example", "finalize_v3_fixture", "--", signatures, mode], { cwd: repo, encoding: "utf8" }).trim();
+}
+const exact = finalized(finalSignatures);
+const verified = JSON.parse(finalSigner.verify_finalized_v3(exact));
+assert.equal(verified.transactionHex, exact);
+assert.match(verified.txid, /^[0-9a-f]{64}$/);
+assert.match(verified.sha256, /^[0-9a-f]{64}$/);
+assert.deepEqual(JSON.parse(finalSigner.verify_finalized_v3(exact)), verified);
+assert.throws(() => finalSigner.verify_finalized_v3(finalizedFixture.transactionHex), /a different finalized transaction was already verified/);
+const errors = {
+    proof: /completed payment proof invalid/,
+    spend: /completed payment spend authorization invalid/,
+    binding: /completed payment binding signature invalid/,
+    effect: /finalized effects differ from signed payment/,
+    version: /noncanonical payment transaction/,
+    mass: /noncanonical payment transaction length or mass/,
+    "cached-id": /cached transaction ID differs from computed ID/,
+    trailing: /noncanonical payment transaction length or mass/,
+    "payload-length": /noncanonical payment transaction length or mass/,
+};
+for (const [mode, expected] of Object.entries(errors)) {
+    const seed = Uint8Array.from(Buffer.from(finalizedFixture.provenance.accountSeedHex, "hex"));
+    const fresh = new PrivateAccountSigner(seed, "mainnet", finalizedFixture.genesisHex, JSON.stringify(finalizedFixture.approvedIntent));
+    const signatures = fresh.sign_prepared_v3(finalPrepared);
+    assert.throws(() => fresh.verify_finalized_v3(finalized(signatures, mode)), expected, mode);
+    fresh.free();
+}
+assert.throws(() => finalSigner.verify_finalized_v3("00"));
+finalSigner.free();
+console.log("browser finalized WASM: full proof, spend, binding, transaction shape and exact-handle checks passed");

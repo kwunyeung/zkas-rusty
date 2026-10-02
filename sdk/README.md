@@ -9,6 +9,7 @@ language packages are bindings around the same reviewed code.
 - `wallet-engine/` — transport-independent wallet policy and, incrementally,
   synchronization, storage, transaction lifecycle, and history.
 - `signer/` — reusable key custody and anti-blind payment authorization.
+- `browser-signer/` — wallet-private version-3 signing and completed-proof verification.
 - `core/` — public `zkas-sdk` facade, BlockDAG sync API, stores, addresses,
   prepared-payment format, and examples.
 - `bindings/` — pointers to out-of-tree bindings; the TypeScript package lives

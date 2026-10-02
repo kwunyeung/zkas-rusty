@@ -1,0 +1,9 @@
+# Browser payment signer
+
+`PrivateAccountSigner` is constructed inside the wallet with its account seed, trusted network genesis, and locally approved outputs and fee ceiling. The constructor clears the caller's seed buffer. The handle retains the seed privately and does not expose a raw signing or viewing-key export.
+
+Call `sign_prepared_v3` with the canonical version-3 envelope returned by a prover. The handle independently checks the complete unsigned bundle and recipient recovery against its approval, then returns the exact spend-authorization signatures. Its first successful signature set is retained. Repeating the same envelope returns those same signatures; a different prepared payment requires a new wallet approval and handle.
+
+After finalization, call `verify_finalized_v3` on the complete Borsh transaction hex before submitting it. The handle accepts only the normal shielded-payment transaction shape, recomputes its transaction ID and SHA-256, checks the signed effects and exact returned spend signatures against its retained envelope, and verifies the completed Orchard proof, spend authorizations, and binding signature. It returns the verified `transactionHex`, `txid`, and `sha256` as JSON and retains the first verified bytes for exact retries. The caller cannot replace the approved intent, prepared envelope, or signatures during this check. Only locally computed identifiers should be passed into a credentialed submit/status flow.
+
+The browser build uses the `kaspa-shielded-core/browser-verifier` feature, which enables the same fixed Orchard verifier without native multicore proving. Native node builds continue to use the existing `circuit` feature. The browser bundle must be built and tested with the pinned workspace lockfile and real WASM proof fixture before release.

@@ -9966,12 +9966,17 @@ dependencies = [
 name = "zkas-browser-signer"
 version = "2.0.1"
 dependencies = [
+ "borsh",
  "getrandom 0.4.2",
  "hex",
  "incrementalmerkletree",
+ "kaspa-consensus-core",
+ "kaspa-hashes",
  "kaspa-shielded-core",
+ "kaspa-shielded-wallet",
  "serde",
  "serde_json",
+ "sha2",
  "wasm-bindgen",
  "zakura-orchard",
  "zeroize",
