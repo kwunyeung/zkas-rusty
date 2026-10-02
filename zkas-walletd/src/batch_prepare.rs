@@ -1013,6 +1013,18 @@ fn canonical_decimal(value: &str) -> bool {
 }
 
 fn valid_batch_origin(origin: &str) -> bool {
+    if let Some(authority) = origin.strip_prefix("http://") {
+        let Some((host, port)) = authority.split_once(':') else {
+            return false;
+        };
+        // Browsers omit the default HTTP port from the Origin header.
+        return origin.len() <= 200
+            && matches!(host, "localhost" | "127.0.0.1")
+            && !port.is_empty()
+            && !port.starts_with('0')
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|number| number > 0 && number != 80);
+    }
     let Some(authority) = origin.strip_prefix("https://") else {
         return false;
     };
@@ -1399,6 +1411,59 @@ mod tests {
         assert!(capability_headers(&headers).is_err());
         headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Batch {}", "AA".repeat(32))).unwrap());
         assert!(capability_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn batch_origin_accepts_only_explicit_canonical_loopback_http_ports() {
+        for origin in [
+            "https://example.test",
+            "https://example.test:8443",
+            "http://localhost:8765",
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:65535",
+        ] {
+            assert!(valid_batch_origin(origin), "rejected {origin}");
+        }
+        for origin in [
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://localhost:0",
+            "http://localhost:00",
+            "http://localhost:08080",
+            "http://localhost:80",
+            "http://localhost:65536",
+            "http://LOCALHOST:8765",
+            "http://localhost.:8765",
+            "http://localhost.evil.test:8765",
+            "http://127.0.0.2:8765",
+            "http://[::1]:8765",
+            "http://100.100.100.100:8765",
+            "http://example.test:8765",
+            "http://user@localhost:8765",
+            "http://localhost:8765/",
+            "http://localhost:8765/path",
+            "http://localhost:8765?x=1",
+            "http://localhost:8765#fragment",
+            "http://localhost:8765:*",
+            "HTTP://localhost:8765",
+        ] {
+            assert!(!valid_batch_origin(origin), "accepted {origin}");
+        }
+    }
+
+    #[test]
+    fn loopback_capability_is_bound_to_the_exact_browser_origin() {
+        let now = std::time::Instant::now();
+        let fvk = [9; 96];
+        let intent = BatchIntent { account: [5; 43], outputs: vec![], max_fee: 10 };
+        let mut registry = BatchRegistry::default();
+        let origin = "http://localhost:8765";
+        assert!(valid_batch_origin(origin));
+        let capability = registry.issue(fvk, "owner", origin, [7; 32], intent, now).unwrap();
+        assert_eq!(registry.authorize(&capability, origin, now).unwrap(), fvk);
+        for other in ["http://localhost:8766", "http://127.0.0.1:8765", "https://localhost:8765"] {
+            assert!(registry.authorize(&capability, other, now).is_err());
+        }
     }
 
     #[test]
