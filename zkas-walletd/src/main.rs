@@ -3,6 +3,7 @@
 //! the desktop wallet can embed it in-process.
 
 use clap::Parser;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use zkas_walletd::{Config, default_wallet_dir, serve};
 
@@ -119,7 +120,8 @@ struct Cli {
     #[arg(long)]
     public_host: Option<String>,
     /// With --serve-public, override the generated bearer token (otherwise one is minted
-    /// and persisted next to the cert).
+    /// and persisted next to the cert). Ordinary loopback/proxied mode instead reads
+    /// ZKAS_WALLETD_BEARER_TOKEN from its private environment when a bearer is required.
     #[arg(long)]
     api_token: Option<String>,
     /// Disable every custodial (seed-holding) endpoint: create, import, send,
@@ -205,6 +207,53 @@ fn main() {
             std::process::exit(1);
         });
     runtime.block_on(run(cli));
+}
+
+fn normal_mode_bearer(value: Option<OsString>, serve_public: bool) -> Result<Option<String>, &'static str> {
+    if serve_public {
+        return if value.is_some() { Err("ZKAS_WALLETD_BEARER_TOKEN cannot be combined with --serve-public") } else { Ok(None) };
+    }
+    let Some(value) = value else { return Ok(None) };
+    let token = value.into_string().map_err(|_| "invalid ZKAS_WALLETD_BEARER_TOKEN")?;
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err("invalid ZKAS_WALLETD_BEARER_TOKEN");
+    }
+    Ok(Some(token))
+}
+
+fn ordinary_config(
+    cli: &Cli,
+    wallet_dir: String,
+    wallet_secret: Option<String>,
+    resources: zkas_walletd::ResourceLimits,
+    listen: SocketAddr,
+    idle_timeout: Option<std::time::Duration>,
+    bearer: Option<String>,
+) -> Config {
+    Config {
+        enable_multiparty: cli.enable_multiparty,
+        rpc_server: cli.rpc_server.clone(),
+        listen,
+        wallet_dir,
+        network: cli.network.clone(),
+        allow_origin: cli.allow_origin.clone(),
+        allow_default_token: cli.allow_default_token,
+        wallet_secret,
+        // Ordinary deployments provide TLS through their proxy when needed.
+        tls: None,
+        require_bearer: bearer,
+        auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
+        build_shared_tree: true,
+        node_socks_proxy: None,
+        allow_custodial: !cli.no_custodial,
+        // 0 makes no sense (every prepare would 503); fall back to the default.
+        max_concurrent_proves: cli
+            .max_concurrent_proves
+            .filter(|n| *n > 0)
+            .unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
+        resources,
+        idle_timeout,
+    }
 }
 
 async fn run(cli: Cli) {
@@ -297,6 +346,7 @@ async fn run(cli: Cli) {
     // FIRECASH_WALLET_SECRET env (still honored so pre-rebrand service files work).
     let wallet_secret = cli
         .wallet_secret
+        .clone()
         .or_else(|| std::env::var("ZKAS_WALLET_SECRET").ok())
         .or_else(|| std::env::var("FIRECASH_WALLET_SECRET").ok());
 
@@ -340,6 +390,12 @@ async fn run(cli: Cli) {
     // 0 is spelled "never" rather than "shut down immediately", which is the reading
     // a user who types 0 to disable it expects.
     let idle_timeout = cli.idle_timeout.filter(|m| *m > 0).map(|m| std::time::Duration::from_secs(m * 60));
+
+    let bearer =
+        normal_mode_bearer(std::env::var_os("ZKAS_WALLETD_BEARER_TOKEN"), cli.serve_public.is_some()).unwrap_or_else(|error| {
+            log::error!("{error}");
+            std::process::exit(1);
+        });
 
     // Self-hosting mode: one flag gives TLS + bearer + a pairing QR, no proxy.
     if let Some(addr) = cli.serve_public {
@@ -387,33 +443,85 @@ async fn run(cli: Cli) {
         std::process::exit(1);
     }
 
-    let cfg = Config {
-        enable_multiparty: cli.enable_multiparty,
-        rpc_server: cli.rpc_server,
-        listen,
-        wallet_dir,
-        network: cli.network,
-        allow_origin: cli.allow_origin,
-        allow_default_token: cli.allow_default_token,
-        wallet_secret,
-        // Loopback / proxied deployment: no built-in TLS, no bearer gate.
-        tls: None,
-        require_bearer: None,
-        auto_consolidate: (!cli.no_auto_consolidate).then_some(cli.auto_consolidate),
-        build_shared_tree: true,
-        node_socks_proxy: None,
-        allow_custodial: !cli.no_custodial,
-        // 0 makes no sense (every prepare would 503); fall back to the default.
-        max_concurrent_proves: cli
-            .max_concurrent_proves
-            .filter(|n| *n > 0)
-            .unwrap_or_else(zkas_walletd::default_max_concurrent_proves),
-        resources,
-        idle_timeout,
-    };
+    let cfg = ordinary_config(&cli, wallet_dir, wallet_secret, resources, listen, idle_timeout, bearer);
 
     if let Err(e) = serve(cfg, shutdown_rx).await {
         log::error!("{e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod bearer_cli_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("zkas-walletd").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn ordinary_mode_binds_optional_bearer_without_enabling_custodial_endpoints() {
+        let baseline = cli(&[]);
+        let baseline_bearer = normal_mode_bearer(None, false).unwrap();
+        let baseline_config = ordinary_config(
+            &baseline,
+            "test-wallet-dir".to_string(),
+            None,
+            zkas_walletd::ResourceLimits::default(),
+            baseline.listen.parse().unwrap(),
+            None,
+            baseline_bearer,
+        );
+        assert!(baseline_config.require_bearer.is_none());
+        assert!(baseline_config.allow_custodial);
+        assert!(baseline_config.tls.is_none());
+
+        let watch_only = cli(&["--no-custodial", "--allow-origin", "https://wallet.example"]);
+        let bearer = normal_mode_bearer(Some(OsString::from(TOKEN)), false).unwrap();
+        let config = ordinary_config(
+            &watch_only,
+            "test-wallet-dir".to_string(),
+            None,
+            zkas_walletd::ResourceLimits::default(),
+            watch_only.listen.parse().unwrap(),
+            None,
+            bearer,
+        );
+        assert_eq!(config.require_bearer.as_deref(), Some(TOKEN));
+        assert!(!config.allow_custodial);
+        assert_eq!(config.allow_origin, vec!["https://wallet.example"]);
+        assert_eq!(config.listen, "127.0.0.1:8501".parse().unwrap());
+        assert_eq!(config.wallet_dir, "test-wallet-dir");
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_bearer_configuration_is_refused() {
+        assert!(normal_mode_bearer(Some(OsString::from(TOKEN)), true).is_err());
+        assert!(normal_mode_bearer(None, true).unwrap().is_none());
+        for denied in [
+            "".to_string(),
+            "0".repeat(63),
+            "0".repeat(65),
+            "A".repeat(64),
+            format!(" {}", TOKEN),
+            format!("{}\n", TOKEN),
+            format!("{}\r", TOKEN),
+            format!("{}g", &TOKEN[..63]),
+        ] {
+            let error = normal_mode_bearer(Some(OsString::from(&denied)), false).unwrap_err();
+            if !denied.is_empty() {
+                assert!(!error.contains(&denied));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_bearer_configuration_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        assert!(normal_mode_bearer(Some(OsString::from_vec(vec![0xff])), false).is_err());
     }
 }
