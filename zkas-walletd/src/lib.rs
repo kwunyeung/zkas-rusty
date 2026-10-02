@@ -43,10 +43,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use sha2::Digest;
 
 pub mod selfhost;
 pub use selfhost::{SelfHostConfig, run_selfhost};
 mod batch_prepare;
+mod batch_journal;
+use batch_journal::BatchJournal;
 use batch_prepare::BatchRegistry;
 #[cfg(test)]
 use batch_prepare::{BatchGrantReq, BatchStart, choose_batch_spends, parse_batch_intent};
@@ -2265,20 +2268,180 @@ fn decode_block(b: &kaspa_rpc_core::RpcShieldedChainBlock) -> DecodedBlock {
 /// sync loop ingests — the node's own acceptance record, not an inference from where a
 /// transaction body happens to sit.
 ///
-/// `GetShieldedBlocks` resumes strictly *after* its cursor, so this asks from the chain
-/// block below `chain` and takes the one block that follows. `None` means the node could
-/// not answer (pruned, or too old to carry `accepted_txids`) — which callers must treat as
-/// "unknown", never as "accepted".
-async fn accepted_txids_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> Option<Vec<[u8; 32]>> {
-    let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa) };
-    let prev = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await.ok()?.ok()?;
-    let page = tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(prev.block_hash, 1)).await.ok()?.ok()?;
-    let b = page.blocks.into_iter().find(|b| b.hash == chain)?;
-    // A pre-v2 node returns no txids at all; that is "unknown", not "accepted nothing".
-    if b.accepted_txids.is_empty() {
-        return None;
+/// The selected-chain frontier locator may return a sparse checkpoint below
+/// pruning, rather than the immediate predecessor of `chain`.
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptanceLookup {
+    Found(Vec<[u8; 32]>),
+    Replaced,
+    Unavailable,
+}
+
+struct AcceptanceWalk {
+    target: RpcHash,
+    target_daa: u64,
+    cursor: RpcHash,
+    last_daa: u64,
+    seen: HashSet<[u8; 32]>,
+    blocks_seen: usize,
+}
+
+impl AcceptanceWalk {
+    // A bounded lookup can stop before the target when many blocks share its DAA.
+    // Exhaustion is unavailable evidence, never proof of replacement.
+    const MAX_BLOCKS: usize = 2_100;
+    const PAGE: usize = 512;
+
+    fn new(target: RpcHash, target_daa: u64, cursor: RpcHash, cursor_daa: u64) -> Option<Self> {
+        (cursor_daa < target_daa).then(|| Self {
+            target, target_daa, cursor, last_daa: cursor_daa,
+            seen: HashSet::from([cursor.as_bytes()]), blocks_seen: 0,
+        })
     }
-    Some(b.accepted_txids.iter().map(|h| h.as_bytes()).collect())
+
+    fn next_limit(&self) -> usize {
+        Self::PAGE.min(Self::MAX_BLOCKS.saturating_sub(self.blocks_seen))
+    }
+
+    /// `None` means the bounded walk needs another page. Other outcomes are final.
+    fn observe_page(&mut self, page: &kaspa_rpc_core::GetShieldedBlocksResponse, requested: usize) -> Option<AcceptanceLookup> {
+        if page.reorged || page.blocks.is_empty() || page.blocks.len() > requested
+            || page.blocks.len() > Self::MAX_BLOCKS.saturating_sub(self.blocks_seen) {
+            return Some(AcceptanceLookup::Unavailable);
+        }
+        for block in &page.blocks {
+            let hash = block.hash.as_bytes();
+            if block.hash == self.cursor || !self.seen.insert(hash)
+                || block.daa_score < self.last_daa || block.accepted_actions.len() != block.accepted_txids.len() {
+                return Some(AcceptanceLookup::Unavailable);
+            }
+            self.blocks_seen += 1;
+            self.last_daa = block.daa_score;
+            self.cursor = block.hash;
+            if block.hash == self.target {
+                return Some(if block.daa_score == self.target_daa && !block.accepted_txids.is_empty() {
+                    AcceptanceLookup::Found(block.accepted_txids.iter().map(|id| id.as_bytes()).collect())
+                } else { AcceptanceLookup::Unavailable });
+            }
+            if block.daa_score > self.target_daa {
+                return Some(AcceptanceLookup::Replaced);
+            }
+        }
+        (self.blocks_seen == Self::MAX_BLOCKS).then_some(AcceptanceLookup::Unavailable)
+    }
+}
+
+async fn selected_acceptance_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> AcceptanceLookup {
+    let lookup = async {
+        let req = kaspa_rpc_core::GetShieldedTreeStateRequest { block_hash: None, below_daa_score: Some(daa) };
+        let prev = match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_tree_state_call(None, req)).await {
+            Ok(Ok(prev)) if prev.history_from_daa_score <= daa => prev,
+            _ => return AcceptanceLookup::Unavailable,
+        };
+        let Some(mut walk) = AcceptanceWalk::new(chain, daa, prev.block_hash, prev.daa_score) else {
+            return AcceptanceLookup::Unavailable;
+        };
+        loop {
+            let limit = walk.next_limit();
+            if limit == 0 { return AcceptanceLookup::Unavailable; }
+            let page = match tokio::time::timeout(SYNC_RPC_TIMEOUT, client.get_shielded_blocks(walk.cursor, limit as u64)).await {
+                Ok(Ok(page)) => page,
+                _ => return AcceptanceLookup::Unavailable,
+            };
+            if let Some(result) = walk.observe_page(&page, limit) { return result; }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), lookup).await.unwrap_or(AcceptanceLookup::Unavailable)
+}
+
+async fn accepted_txids_at(client: &GrpcClient, chain: RpcHash, daa: u64) -> Option<Vec<[u8; 32]>> {
+    match selected_acceptance_at(client, chain, daa).await {
+        AcceptanceLookup::Found(ids) => Some(ids),
+        AcceptanceLookup::Replaced | AcceptanceLookup::Unavailable => None,
+    }
+}
+
+#[cfg(test)]
+mod accepted_lookup_tests {
+    use super::*;
+
+    fn block(n: u32, daa: u64, txid: Option<[u8; 32]>) -> RpcShieldedChainBlock {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&n.to_le_bytes());
+        RpcShieldedChainBlock {
+            hash: RpcHash::from_bytes(hash), blue_score: n as u64, daa_score: daa,
+            coinbase_txid: RpcHash::default(), coinbase_outputs: vec![],
+            accepted_actions: txid.map(|_| vec![vec![0; 148]]).unwrap_or_default(),
+            accepted_txids: txid.map(|id| vec![RpcHash::from_bytes(id)]).unwrap_or_default(), timestamp: 0,
+        }
+    }
+
+    fn page(blocks: Vec<RpcShieldedChainBlock>) -> kaspa_rpc_core::GetShieldedBlocksResponse {
+        kaspa_rpc_core::GetShieldedBlocksResponse { blocks, reorged: false, sink_blue_score: 0 }
+    }
+
+    #[test]
+    fn sparse_frontier_walk_finds_exact_target_beyond_first_successor() {
+        let target = block(600, 1600, Some([7; 32]));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, block(0, 1000, None).hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page((1..=512).map(|n| block(n, 1000 + n as u64, None)).collect()), 512), None);
+        assert_eq!(walk.observe_page(&page((513..600).map(|n| block(n, 1000 + n as u64, None)).chain([target]).collect()), 512), Some(AcceptanceLookup::Found(vec![[7; 32]])));
+    }
+
+    #[test]
+    fn unavailable_evidence_never_means_selected_chain_replacement() {
+        let target = block(600, 1600, Some([7; 32]));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, block(0, 1000, None).hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![]), 512), Some(AcceptanceLookup::Unavailable));
+        let mut reorged = page(vec![block(1, 1001, None)]);
+        reorged.reorged = true;
+        assert_eq!(walk.observe_page(&reorged, 512), Some(AcceptanceLookup::Unavailable));
+    }
+
+    #[test]
+    fn replacement_requires_progress_past_target_daa() {
+        let target = block(600, 1600, Some([7; 32]));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, block(0, 1000, None).hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![block(1, 1600, None)]), 512), None);
+        assert_eq!(walk.observe_page(&page(vec![block(2, 1601, None)]), 512), Some(AcceptanceLookup::Replaced));
+    }
+
+    #[test]
+    fn equal_daa_wrong_hash_does_not_hide_later_exact_target() {
+        let target = block(3, 1600, Some([7; 32]));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, block(0, 1000, None).hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![block(1, 1600, None)]), 512), None);
+        assert_eq!(walk.observe_page(&page(vec![block(2, 1600, None), target]), 512), Some(AcceptanceLookup::Found(vec![[7; 32]])));
+    }
+
+    #[test]
+    fn malformed_or_unavailable_pages_do_not_claim_replacement() {
+        let target = block(3, 1600, Some([7; 32]));
+        let anchor = block(0, 1000, None);
+        let mut malformed = block(1, 1500, Some([9; 32]));
+        malformed.accepted_actions.clear();
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, anchor.hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![malformed]), 512), Some(AcceptanceLookup::Unavailable));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, anchor.hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![anchor.clone()]), 512), Some(AcceptanceLookup::Unavailable));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, anchor.hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![block(1, 1000, None), anchor.clone()]), 512), Some(AcceptanceLookup::Unavailable));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, anchor.hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![block(1, 1500, None), block(2, 1499, None)]), 512), Some(AcceptanceLookup::Unavailable));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, anchor.hash, 1000).unwrap();
+        assert_eq!(walk.observe_page(&page(vec![block(3, 1600, None)]), 512), Some(AcceptanceLookup::Unavailable));
+        assert!(AcceptanceWalk::new(target.hash, 1600, anchor.hash, 1600).is_none());
+    }
+
+    #[test]
+    fn frontier_walk_has_a_strict_total_block_budget() {
+        let target = block(3, 1600, Some([7; 32]));
+        let mut walk = AcceptanceWalk::new(target.hash, 1600, block(0, 1000, None).hash, 1000).unwrap();
+        walk.blocks_seen = AcceptanceWalk::MAX_BLOCKS - 1;
+        assert_eq!(walk.observe_page(&page(vec![block(1, 1500, None), block(2, 1501, None)]), 2), Some(AcceptanceLookup::Unavailable));
+        assert_eq!(walk.next_limit(), 1);
+        assert_eq!(walk.observe_page(&page(vec![block(1, 1600, None)]), 1), Some(AcceptanceLookup::Unavailable));
+    }
 }
 
 /// The full shielded bundle of `txid`, **which chain block `chain` accepted**.
@@ -4392,6 +4555,10 @@ struct AppState {
     prepared: Mutex<HashMap<String, PreparedSession>>,
     /// At most one unresolved multi-output intent per decoded viewing key.
     batch_preparations: std::sync::Mutex<BatchRegistry>,
+    batch_journal: std::sync::Mutex<BatchJournal>,
+    journal_reconcile: tokio::sync::Mutex<()>,
+    batch_journal_ready: bool,
+    submitting: std::sync::Mutex<HashSet<[u8; 96]>>,
     /// Last-known-good status per loaded wallet, read by `status` when the wallet mutex
     /// is momentarily held by the sync loop (see [`StatusSnap`]). Refreshed by the sync
     /// loop each pass and by any `status` call that acquires the wallet lock.
@@ -4719,6 +4886,41 @@ impl Drop for PreparingGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = self.state.preparing.lock() {
             set.remove(&self.key);
+        }
+    }
+}
+
+struct SubmissionGuard {
+    state: Arc<AppState>,
+    fvk: [u8; 96],
+}
+
+impl SubmissionGuard {
+    fn new(state: &Arc<AppState>, fvk: [u8; 96], legacy: bool) -> Result<Self, (StatusCode, Json<serde_json::Value>)> {
+        if legacy && !state.batch_journal_ready {
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "payment journal migration is required"));
+        }
+        let _preparing = state.preparing.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "prepare tracker unavailable"))?;
+        if legacy {
+            if state.batch_preparations.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "batch tracker unavailable"))?
+                .reserves(&fvk, std::time::Instant::now())
+                || state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?.reserves(&fvk)
+            {
+                return Err(err(StatusCode::CONFLICT, "this wallet has an unresolved payment"));
+            }
+        }
+        let mut submitting = state.submitting.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "submission tracker unavailable"))?;
+        if !submitting.insert(fvk) {
+            return Err(err(StatusCode::CONFLICT, "this wallet has a submission in progress"));
+        }
+        Ok(Self { state: state.clone(), fvk })
+    }
+}
+
+impl Drop for SubmissionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut submitting) = self.state.submitting.lock() {
+            submitting.remove(&self.fvk);
         }
     }
 }
@@ -6447,7 +6649,9 @@ async fn sync_one_wallet(state: Arc<AppState>, token: String, w: Wallet, chain_l
     // 2026-07-18: "ZKAS disappeared without a trace" was exactly this). Only
     // judged when caught up, so "unobserved" means the chain really doesn't have
     // it, not that we haven't looked yet.
-    if e.caught_up {
+    let journal_reserves = (!state.batch_journal_ready && !state.allow_custodial && !state.enable_multiparty)
+        || state.batch_journal.lock().map(|journal| journal.reserves(&e.db.fvk().to_bytes())).unwrap_or(true);
+    if e.caught_up && !journal_reserves {
         let now_daa = e.scanned as u64;
         for (txid, value) in e.db.reclaim_expired(now_daa, PENDING_SPEND_EXPIRY_DAA) {
             e.force_checkpoint = true; // persist the returned note promptly
@@ -9321,11 +9525,23 @@ async fn wallet_prepare(
     Json(req): Json<PrepareReq>,
 ) -> Result<Json<PrepareResp>, (StatusCode, Json<serde_json::Value>)> {
     use rand::RngCore;
+    if !state.batch_journal_ready && !state.allow_custodial && !state.enable_multiparty {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "payment journal migration is required"));
+    }
 
-    // Watch-only: authenticated by possession of the FVK, not a token/seed.
+    // A registered watch-only account is required in the single-owner profile;
+    // the legacy request still carries the FVK for payment preparation.
     let fvk_bytes = unhex(&req.fvk_hex)
         .and_then(|b| <[u8; FVK_LEN]>::try_from(b.as_slice()).ok())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "fvk_hex must be 96 bytes of hex"))?;
+    if !state.allow_custodial && !state.enable_multiparty {
+        let token = token_from(&headers, false).map_err(|_| err(StatusCode::UNAUTHORIZED, "register a watch-only wallet token before preparing a payment"))?;
+        let wallet = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::UNAUTHORIZED, "register a watch-only wallet token before preparing a payment"))?;
+        let entry = wallet.lock().await;
+        if !entry.key.is_watch_only() || entry.db.fvk().to_bytes() != fvk_bytes {
+            return Err(err(StatusCode::FORBIDDEN, "registered watch-only wallet does not match this viewing key"));
+        }
+    }
 
     // Is this wallet paying ITSELF? Decided from the viewing key and the recipient,
     // both cheap to derive, so it is known before anything is reserved.
@@ -9334,6 +9550,19 @@ async fn wallet_prepare(
         .and_then(|to| orchard_recipient_bytes(&to))
         .zip(WalletDb::from_fvk(&fvk_bytes))
         .is_some_and(|(recipient, db)| db.my_address_bytes() == recipient);
+    let journal_scope = state.journal_reconcile.lock().await;
+    let mut checked_journal = false;
+    if let Ok(token) = token_from(&headers, state.allow_default_token) {
+        if let Some(wallet) = state.get_wallet(&token).await {
+            if wallet.lock().await.db.fvk().to_bytes() == fvk_bytes {
+                batch_prepare::reconcile_wallet_journal(&state, &wallet, &fvk_bytes).await?;
+                checked_journal = true;
+            }
+        }
+    }
+    if !checked_journal && !state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?.records_for_fvk(&fvk_bytes).is_empty() {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "registered wallet required for payment reconciliation"));
+    }
 
     // One preparation per wallet: a second would select the same notes as the one in
     // flight. Rejecting is right; the old wording was not. It said "wait for it to
@@ -9382,9 +9611,16 @@ async fn wallet_prepare(
         {
             return Err(err(StatusCode::CONFLICT, "this wallet already has an unresolved multi-output preparation"));
         }
+        if state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?.reserves(&fvk_bytes) {
+            return Err(err(StatusCode::CONFLICT, "this wallet has an unresolved submitted payment"));
+        }
+        if state.submitting.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "submission tracker unavailable"))?.contains(&fvk_bytes) {
+            return Err(err(StatusCode::CONFLICT, "this wallet has a submission in progress"));
+        }
         set.insert(guard_key.clone(), (std::time::Instant::now(), self_payment));
         PreparingGuard { state: state.clone(), key: guard_key }
     };
+    drop(journal_scope);
 
     let requested = match (req.amount_sompi, req.amount_fc) {
         (Some(s), _) => s.parse("amount_sompi")?,
@@ -9869,6 +10105,12 @@ async fn wallet_submit(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SubmitReq>,
 ) -> Result<Json<SendResp>, (StatusCode, Json<serde_json::Value>)> {
+    let fvk_for_guard = {
+        let map = state.prepared.lock().await;
+        map.get(&req.session).map(|session| session.fvk)
+    }.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
+    let _submission = SubmissionGuard::new(&state, fvk_for_guard, true)?;
+    let _journal_scope = state.journal_reconcile.lock().await;
     // Pop the session (single-use); also sweep any expired ones.
     let session = {
         let now = std::time::Instant::now();
@@ -9876,7 +10118,7 @@ async fn wallet_submit(
         map.retain(|_, s| now.duration_since(s.created) < PREPARED_TTL);
         map.remove(&req.session)
     };
-    let PreparedSession { payment, amount, fee, token, positions, .. } =
+    let PreparedSession { payment, fvk, amount, fee, token, positions, .. } =
         session.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such prepared session (expired or already submitted)"))?;
 
     // How many actions this transaction actually has, so a client-supplied index cannot
@@ -9916,10 +10158,8 @@ async fn wallet_submit(
         // does not match the wallet the token addresses" from a general fault: seen
         // live 2026-08-07, one wallet failed 3/3 while another succeeded in between.
         log::error!(
-            "submit REJECTED for session {} (wallet token {}): finalize_payment failed with {n_sigs} device \
+            "submit REJECTED: finalize_payment failed with {n_sigs} device \
              signature(s) for action index/es {sig_indices:?}: {e:?}",
-            req.session,
-            token.as_deref().unwrap_or("<none>"),
         );
         err(
             StatusCode::BAD_REQUEST,
@@ -9928,12 +10168,44 @@ async fn wallet_submit(
         )
     })?;
     let tx: Transaction = payment_tx(bundle.to_bytes());
+    let legacy_journal_key = if !state.allow_custodial && !state.enable_multiparty {
+        let bytes = borsh::to_vec(&tx).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "transaction serialization failed"))?;
+        let intent_hash: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let account = WalletDb::from_fvk(&fvk)
+            .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "invalid viewing key"))?.my_address_bytes();
+        let logical_id = tx.id().as_bytes();
+        let record = batch_journal::JournalRecord::new(
+            fvk, token.as_deref().unwrap_or(""), state.genesis.as_bytes(), account,
+            "legacy", logical_id, intent_hash, bytes, positions.clone(),
+        ).map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "legacy payment journal failed"))?;
+        let cursor = if let Some(token) = token.as_deref() {
+            if let Some(wallet) = state.get_wallet(token).await { wallet.lock().await.low.as_bytes() } else { state.genesis.as_bytes() }
+        } else { state.genesis.as_bytes() };
+        let mut journal = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?;
+        journal.insert(record).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "payment journal unavailable"))?;
+        journal.begin_attempt(&batch_journal::fvk_hash(&fvk), &logical_id, cursor)
+            .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "payment journal unavailable"))?;
+        Some((batch_journal::fvk_hash(&fvk), logical_id))
+    } else { None };
     let node = state
         .request_client()
         .await
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "the wallet service cannot reach its node to broadcast; nothing was sent"))?;
-    match node.submit_transaction(RpcTransaction::from(&tx), false).await {
+    let submitted = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.submit_transaction(RpcTransaction::from(&tx), false)).await
+        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, format!("Payment outcome is unknown; use the credentialed journal status before retrying. Transaction id: {}", tx.id())))?;
+    match submitted {
         Ok(accepted) => {
+            if accepted.as_bytes() != tx.id().as_bytes() {
+                return Err(err(StatusCode::BAD_GATEWAY, "node returned a different transaction id; payment outcome unknown"));
+            }
+            if let Some((fvk_hash, logical_id)) = legacy_journal_key {
+                if let Ok(mut journal) = state.batch_journal.lock() {
+                    if let Some(mut record) = journal.get(&fvk_hash, &logical_id).cloned() {
+                        record.phase = batch_journal::JournalPhase::Mempool;
+                        let _ = journal.update(&mut record);
+                    }
+                }
+            }
             // The node has the transaction: park the notes it spends so they leave the
             // unspent set NOW rather than ~3 minutes from now when the block carrying
             // them clears the reorg holdback. Parking (not deleting) is what makes this
@@ -9972,8 +10244,8 @@ async fn wallet_submit(
             }))
         }
         Err(e) => {
-            log::error!("submit REJECTED by the node for session {}: {e}", req.session);
-            Err(err(StatusCode::BAD_GATEWAY, format!("The node would not accept this payment: {e}. No coins moved.")))
+            log::error!("submit REJECTED by the node: {e}");
+            Err(err(StatusCode::BAD_GATEWAY, format!("Payment outcome is unknown; use the credentialed journal status before retrying. Transaction id: {}. Node response: {e}", tx.id())))
         }
     }
 }
@@ -11118,10 +11390,12 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     // Must happen before the first connect below.
     kaspa_grpc_client::set_node_socks_proxy(cfg.node_socks_proxy.clone());
     let wallet_dir = cfg.wallet_dir;
+    let fresh_wallet_dir = !std::path::Path::new(&wallet_dir).exists();
     // Read before `wallet_dir` is moved into the state below.
     let activity_seed = load_activity(&wallet_dir);
     let snap_seed = load_snaps(&wallet_dir);
     let _ = std::fs::create_dir_all(&wallet_dir);
+    batch_journal::verify_private_wallet_dir(std::path::Path::new(&wallet_dir), fresh_wallet_dir)?;
 
     // Two node connections: one for the request path, one for the background sync loop,
     // so heavy sync traffic can't stall user wallet loads. Retry until the node is up —
@@ -11203,6 +11477,8 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
     let resources = cfg.resources.clone();
     log::info!("wallet resource limits: {:?}", resources);
     let chain_tree = build_chain_tree(&wallet_dir, genesis);
+    let batch_journal = BatchJournal::open(&std::path::Path::new(&wallet_dir).join("batch-journal"), genesis.as_bytes())?;
+    let batch_journal_ready = batch_journal::migration_ready(std::path::Path::new(&wallet_dir), genesis.as_bytes(), fresh_wallet_dir)?;
     let state = Arc::new(AppState {
         enable_multiparty: cfg.enable_multiparty,
         bundles: Mutex::new(HashMap::new()),
@@ -11250,6 +11526,10 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         node_tip: Mutex::new((0, std::time::Instant::now())),
         prepared: Mutex::new(HashMap::new()),
         batch_preparations: std::sync::Mutex::new(BatchRegistry::default()),
+        batch_journal: std::sync::Mutex::new(batch_journal),
+        journal_reconcile: tokio::sync::Mutex::new(()),
+        batch_journal_ready,
+        submitting: std::sync::Mutex::new(HashSet::new()),
         snapshots: Mutex::new(HashMap::new()),
         addr_index: Mutex::new(HashMap::new()),
         in_pass: std::sync::Mutex::new(HashSet::new()),
@@ -11441,6 +11721,10 @@ pub async fn serve(cfg: Config, mut shutdown: tokio::sync::oneshot::Receiver<()>
         .route("/api/wallet/prepare-many/capability", post(batch_prepare::issue_batch_capability).layer(DefaultBodyLimit::max(64 * 1024)))
         .route("/api/wallet/prepare-many", post(batch_prepare::prepare_many).get(batch_prepare::prepared_many).layer(DefaultBodyLimit::max(0)))
         .route("/api/wallet/finalize-many", post(batch_prepare::finalize_many).layer(DefaultBodyLimit::max(16 * 1024)))
+        .route("/api/wallet/finalize-many/journal", get(batch_prepare::finalized_many_journal))
+        .route("/api/wallet/submit/uncertain", get(batch_prepare::legacy_uncertain))
+        .route("/api/wallet/submit-many", post(batch_prepare::submit_many).layer(DefaultBodyLimit::max(2 * 1024)))
+        .route("/api/wallet/submit-many/status", get(batch_prepare::status_many))
         .route("/api/wallet/submit", post(wallet_submit))
         .route("/api/wallet/sign", post(wallet_sign))
         .route("/api/verify", post(verify))
@@ -12390,4 +12674,3 @@ async fn bundle_submit(
         }
     }
 }
-

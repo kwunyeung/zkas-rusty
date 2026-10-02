@@ -59,6 +59,7 @@ struct BatchPrepared {
 struct BatchFinalized {
     response: BatchFinalizeResp,
     signatures: Vec<(usize, [u8; 64])>,
+    positions: Vec<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -72,7 +73,7 @@ pub(super) struct BatchFinalizeResp {
 }
 
 impl BatchFinalized {
-    fn new(bytes: Vec<u8>, txid: String, logical_id: [u8; 32], signatures: Vec<(usize, [u8; 64])>) -> Self {
+    fn new(bytes: Vec<u8>, txid: String, logical_id: [u8; 32], signatures: Vec<(usize, [u8; 64])>, positions: Vec<u64>) -> Self {
         Self {
             response: BatchFinalizeResp {
                 status: "finalized",
@@ -82,6 +83,7 @@ impl BatchFinalized {
                 sha256: hex(&sha2::Sha256::digest(&bytes)),
             },
             signatures,
+            positions,
         }
     }
 
@@ -91,7 +93,7 @@ impl BatchFinalized {
 }
 
 enum BatchFinalizeStart {
-    New(Box<BatchPrepared>, BatchIntent),
+    New(Box<BatchPrepared>, BatchIntent, String),
     InProgress,
     Ready(BatchFinalizeResp),
 }
@@ -286,7 +288,7 @@ impl BatchRegistry {
                 validate_spend_signatures(&prepared.payment, signatures, genesis)?;
                 let phase = std::mem::replace(&mut record.phase, BatchPhase::Finalizing);
                 match phase {
-                    BatchPhase::Ready(prepared) => Ok(BatchFinalizeStart::New(prepared, record.intent.clone())),
+                    BatchPhase::Ready(prepared) => Ok(BatchFinalizeStart::New(prepared, record.intent.clone(), record.origin.clone())),
                     _ => unreachable!(),
                 }
             }
@@ -452,21 +454,32 @@ pub(super) async fn finalize_many(
     match start {
         BatchFinalizeStart::Ready(response) => Ok(Json(response)),
         BatchFinalizeStart::InProgress => Err(err(StatusCode::CONFLICT, "finalization in progress; retry the same request")),
-        BatchFinalizeStart::New(prepared, intent) => {
-            let state_for_task = state.clone();
+        BatchFinalizeStart::New(prepared, intent, origin) => {
+            let state_for_job = state.clone();
+            let genesis = state.genesis.as_bytes();
             let signatures_for_task = signatures;
             let (sender, receiver) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
+                let token_for_record = token;
                 let outcome = tokio::task::spawn_blocking(move || {
-                    finalize_batch_prepared(
+                    let intent_hash = batch_journal::intent_hash(&intent);
+                    let finalized = finalize_batch_prepared(
                         *prepared,
                         intent,
                         signatures_for_task,
                         logical_id,
                         fvk,
-                        state_for_task.genesis.as_bytes(),
-                        &state_for_task.network,
-                    )
+                        state_for_job.genesis.as_bytes(),
+                        &state_for_job.network,
+                    )?;
+                    let bytes = hex::decode(&finalized.response.transaction_hex).map_err(|_| "invalid finalized bytes")?;
+                    let record = batch_journal::JournalRecord::new(
+                        fvk, &token_for_record, genesis, account, &origin, logical_id,
+                        intent_hash, bytes, finalized.positions.clone(),
+                    ).map_err(|_| "journal record failed")?;
+                    state_for_job.batch_journal.lock().map_err(|_| "journal unavailable")?
+                        .insert(record).map_err(|_| "journal write failed")?;
+                    Ok(finalized)
                 })
                 .await
                 .unwrap_or(Err("finalization task failed"));
@@ -494,6 +507,7 @@ fn finalize_batch_prepared(
     genesis: [u8; 32],
     network: &str,
 ) -> Result<BatchFinalized, &'static str> {
+    let positions = prepared.positions.clone();
     let fvk = fvk_from_bytes(&fvk_bytes).ok_or("invalid wallet viewing key")?;
     let typed = prepared
         .response
@@ -570,7 +584,313 @@ fn finalize_batch_prepared(
     if decoded != tx || decoded.id() != tx.id() {
         return Err("transaction roundtrip mismatch");
     }
-    Ok(BatchFinalized::new(bytes, hex(&tx.id().as_bytes()), logical_id, signatures))
+    Ok(BatchFinalized::new(bytes, hex(&tx.id().as_bytes()), logical_id, signatures, positions))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BatchStatusQuery {
+    account: String,
+    genesis: String,
+    logical_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct BatchSubmitReq {
+    account: String,
+    genesis: String,
+    logical_id: String,
+    txid: String,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BatchSendStatus {
+    status: &'static str,
+    logical_id: String,
+    txid: String,
+    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    included_block: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    included_daa: Option<u64>,
+}
+
+impl BatchSendStatus {
+    fn from_record(record: &batch_journal::JournalRecord) -> Self {
+        let status = match record.phase {
+            batch_journal::JournalPhase::Finalized => "finalized_unsent",
+            batch_journal::JournalPhase::Unknown => "unknown",
+            batch_journal::JournalPhase::Mempool => "mempool",
+            batch_journal::JournalPhase::Included => "included",
+            batch_journal::JournalPhase::Settled => "settled",
+            batch_journal::JournalPhase::Conflicted => "conflicted",
+            batch_journal::JournalPhase::ConflictSettled => "conflicted",
+        };
+        Self {
+            status,
+            logical_id: hex(&record.logical_id),
+            txid: hex(&record.txid),
+            sha256: hex(&record.sha256),
+            included_block: record.included_block.map(|block| hex(&block)),
+            included_daa: record.included_daa,
+        }
+    }
+}
+
+async fn credentialed_record(
+    state: &Arc<AppState>, headers: &HeaderMap, account_text: &str, genesis_text: &str, logical_text: &str,
+) -> Result<(String, Wallet, [u8; 96], batch_journal::JournalRecord), BatchHttpError> {
+    let token = token_from(headers, false)?;
+    let wallet = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no registered wallet"))?;
+    let (fvk, account) = {
+        let entry = wallet.lock().await;
+        if !entry.key.is_watch_only() { return Err(err(StatusCode::FORBIDDEN, "watch-only wallet required")); }
+        (entry.db.fvk().to_bytes(), entry.db.my_address_bytes())
+    };
+    let address = Address::try_from(account_text).map_err(|_| err(StatusCode::BAD_REQUEST, "invalid account"))?;
+    if address.prefix != state.prefix || orchard_recipient_bytes(&address) != Some(account) {
+        return Err(err(StatusCode::BAD_REQUEST, "account mismatch"));
+    }
+    let genesis = lowercase_hex::<32>(genesis_text).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))?;
+    if genesis != state.genesis.as_bytes() { return Err(err(StatusCode::BAD_REQUEST, "genesis mismatch")); }
+    let logical_id = lowercase_hex::<32>(logical_text).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))?;
+    let record = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+        .get(&batch_journal::fvk_hash(&fvk), &logical_id).cloned()
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown logical payment"))?;
+    if !record.authenticate(&token, &account, &genesis) {
+        return Err(err(StatusCode::NOT_FOUND, "unknown logical payment"));
+    }
+    Ok((token, wallet, fvk, record))
+}
+
+pub(super) async fn submit_many(
+    State(state): State<Arc<AppState>>, headers: HeaderMap, Json(req): Json<BatchSubmitReq>,
+) -> Result<Json<BatchSendStatus>, BatchHttpError> {
+    if !supported_profile(state.allow_custodial, state.enable_multiparty, &state.network) {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, "batch submission requires a watch-only, single-owner daemon profile"));
+    }
+    let _journal_scope = state.journal_reconcile.lock().await;
+    let (token, wallet, fvk, record) = credentialed_record(&state, &headers, &req.account, &req.genesis, &req.logical_id).await?;
+    if lowercase_hex::<32>(&req.txid).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))? != record.txid
+        || lowercase_hex::<32>(&req.sha256).map_err(|reason| err(StatusCode::BAD_REQUEST, reason))? != record.sha256
+    {
+        return Err(err(StatusCode::CONFLICT, "signed transaction identity differs from journal"));
+    }
+    let _submission = SubmissionGuard::new(&state, fvk, false)?;
+    let cursor = {
+        let entry = wallet.lock().await;
+        if record.phase == batch_journal::JournalPhase::Finalized && !entry.caught_up {
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "wallet is not caught up"));
+        }
+        entry.low.as_bytes()
+    };
+    let record = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+        .begin_attempt(&record.fvk_hash, &record.logical_id, cursor)
+        .map_err(|_| err(StatusCode::CONFLICT, "payment is not available for exact retry"))?;
+    {
+        let mut entry = wallet.lock().await;
+        for position in &record.positions { entry.db.mark_spent(*position, record.txid, 0); }
+        entry.force_checkpoint = true;
+    }
+    let transaction = record.transaction().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal transaction invalid"))?;
+    if let Some(node) = state.request_client().await {
+        if let Ok(Ok(accepted)) = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.submit_transaction(RpcTransaction::from(&transaction), false)).await {
+            if accepted.as_bytes() == record.txid {
+                let mut updated = record.clone();
+                updated.phase = batch_journal::JournalPhase::Mempool;
+                let _ = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?.update(&mut updated);
+            }
+        }
+    }
+    let current = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+        .get(&record.fvk_hash, &record.logical_id).cloned().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?;
+    let _ = token;
+    Ok(Json(BatchSendStatus::from_record(&current)))
+}
+
+pub(super) async fn status_many(
+    State(state): State<Arc<AppState>>, headers: HeaderMap, Query(req): Query<BatchStatusQuery>,
+) -> Result<Json<BatchSendStatus>, BatchHttpError> {
+    let _journal_scope = state.journal_reconcile.lock().await;
+    let (_, wallet, _, record) = credentialed_record(&state, &headers, &req.account, &req.genesis, &req.logical_id).await?;
+    let record = reconcile_record(&state, &wallet, record).await?;
+    Ok(Json(BatchSendStatus::from_record(&record)))
+}
+
+pub(super) async fn finalized_many_journal(
+    State(state): State<Arc<AppState>>, headers: HeaderMap, Query(req): Query<BatchStatusQuery>,
+) -> Result<Json<BatchFinalizeResp>, BatchHttpError> {
+    let (_, _, _, record) = credentialed_record(&state, &headers, &req.account, &req.genesis, &req.logical_id).await?;
+    Ok(Json(BatchFinalizeResp {
+        status: "finalized", logical_id: hex(&record.logical_id),
+        transaction_hex: record.transaction_hex, txid: hex(&record.txid), sha256: hex(&record.sha256),
+    }))
+}
+
+pub(super) async fn legacy_uncertain(
+    State(state): State<Arc<AppState>>, headers: HeaderMap,
+) -> Result<Json<Vec<BatchSendStatus>>, BatchHttpError> {
+    let token = token_from(&headers, false)?;
+    let wallet = state.get_wallet(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "no registered wallet"))?;
+    let (fvk, account) = {
+        let entry = wallet.lock().await;
+        (entry.db.fvk().to_bytes(), entry.db.my_address_bytes())
+    };
+    let mut records: Vec<_> = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+        .unresolved_for_fvk(&fvk).into_iter()
+        .filter(|record| record.legacy_for(&token, &account, &state.genesis.as_bytes()))
+        .map(|record| {
+            let unverified_terminal = !record.reserves();
+            let mut status = BatchSendStatus::from_record(&record);
+            if unverified_terminal { status.status = "unknown"; }
+            (unverified_terminal, status)
+        }).collect();
+    records.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.logical_id.cmp(&right.1.logical_id)));
+    records.truncate(32);
+    Ok(Json(records.into_iter().map(|(_, status)| status).collect()))
+}
+
+async fn reconcile_record(
+    state: &Arc<AppState>, wallet: &Wallet, mut record: batch_journal::JournalRecord,
+) -> Result<batch_journal::JournalRecord, BatchHttpError> {
+    use batch_journal::{JournalPhase, Observation};
+    if record.phase == JournalPhase::Finalized { return Ok(record); }
+    let node = state.request_client().await.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "node unavailable for payment reconciliation"))?;
+    let view = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.get_server_info()).await
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "chain status timed out"))?
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "chain status unavailable"))?;
+    if !view.is_synced || view.network_id.network_type() != state_prefix_network(&state.network) {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "node network is unavailable or not synced"));
+    }
+    if let (Some(block), Some(daa)) = (record.included_block, record.included_daa) {
+        let chain_txid = if matches!(record.phase, JournalPhase::Conflicted | JournalPhase::ConflictSettled) { record.conflicting_txid.unwrap_or(record.txid) } else { record.txid };
+        match apply_inclusion_lookup(&mut record, selected_acceptance_at(&node, RpcHash::from_bytes(block), daa).await, chain_txid) {
+            Ok(false) => {}
+            Ok(true) => {
+                // A continuous selected-chain walk passed the old inclusion DAA
+                // without its block. The prior cursor may itself be orphaned.
+                state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+                    .update(&mut record).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "journal unavailable"))?;
+                return Ok(record);
+            }
+            Err(()) => {
+                // Absence of retained acceptance data is not evidence of a
+                // replacement. Keep the durable inclusion and reservation.
+                return Err(err(StatusCode::SERVICE_UNAVAILABLE, "selected-chain acceptance unavailable"));
+            }
+        }
+    } else if let Some(cursor) = record.scan_cursor {
+        match tokio::time::timeout(SYNC_RPC_TIMEOUT, node.get_shielded_blocks(RpcHash::from_bytes(cursor), 512)).await {
+            Ok(Ok(page)) if page.reorged => {
+                record.invalidate_chain_provenance();
+            }
+            Ok(Ok(page)) => {
+                for block in &page.blocks {
+                    match batch_journal::observe_block(&record, block) {
+                        Observation::Included(hash, daa) => {
+                            record.phase = JournalPhase::Included;
+                            record.included_block = Some(hash);
+                            record.included_daa = Some(daa);
+                            break;
+                        }
+                        Observation::Conflicted(txid, hash, daa) => {
+                            record.phase = JournalPhase::Conflicted;
+                            record.conflicting_txid = Some(txid);
+                            record.included_block = Some(hash);
+                            record.included_daa = Some(daa);
+                            break;
+                        }
+                        Observation::Continue(hash) => record.scan_cursor = Some(hash),
+                        Observation::Gap => return Err(err(StatusCode::SERVICE_UNAVAILABLE, "incomplete selected-chain page")),
+                    }
+                }
+            }
+            _ => return Err(err(StatusCode::SERVICE_UNAVAILABLE, "selected-chain page unavailable")),
+        }
+        state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+            .update(&mut record).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "journal unavailable"))?;
+    }
+    if matches!(record.phase, JournalPhase::Unknown | JournalPhase::Mempool) && record.included_block.is_none() {
+        let observed = tokio::time::timeout(SYNC_RPC_TIMEOUT,
+            node.get_mempool_entry(RpcHash::from_bytes(record.txid), true, false)).await
+            .is_ok_and(|result| result.is_ok());
+        let next = if observed { JournalPhase::Mempool } else { JournalPhase::Unknown };
+        if record.phase != next {
+            record.phase = next;
+            state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+                .update(&mut record).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "journal unavailable"))?;
+        }
+    }
+    if matches!(record.phase, JournalPhase::Included | JournalPhase::Conflicted | JournalPhase::Settled | JournalPhase::ConflictSettled) {
+        let was_terminal = matches!(record.phase, JournalPhase::Settled | JournalPhase::ConflictSettled);
+        let included = record.included_daa.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "missing inclusion DAA"))?;
+        let mature_daa = included.checked_add(DEFAULT_ANCHOR_DEPTH).ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "invalid inclusion DAA"))?;
+        if !release_depth_satisfied(included, view.virtual_daa_score, view.virtual_daa_score) {
+            return if was_terminal { Err(err(StatusCode::SERVICE_UNAVAILABLE, "settlement needs fresh chain depth")) } else { Ok(record) };
+        }
+        let block = record.included_block.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "missing inclusion block"))?;
+        let accepted_txid = if matches!(record.phase, JournalPhase::Conflicted | JournalPhase::ConflictSettled) {
+            record.conflicting_txid.ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "missing conflicting transaction"))?
+        } else { record.txid };
+        if !accepted_txids_at(&node, RpcHash::from_bytes(block), included).await
+            .is_some_and(|ids| ids.contains(&accepted_txid)) {
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "selected-chain acceptance unavailable"));
+        }
+        let entry = wallet.lock().await;
+        let wallet_consumed = record.positions.iter().all(|position| {
+            !entry.db.notes().iter().any(|note| note.position == *position)
+                && !entry.db.pending_spends().iter().any(|pending| pending.note.position == *position)
+        });
+        if !record.positions.is_empty() && entry.caught_up && entry.blind_below == 0
+            && entry.reorged_strikes == 0 && release_depth_satisfied(included, view.virtual_daa_score, entry.scanned as u64)
+            && wallet_consumed {
+            drop(entry);
+            let final_view = tokio::time::timeout(SYNC_RPC_TIMEOUT, node.get_server_info()).await
+                .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "chain status timed out"))?
+                .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "chain status unavailable"))?;
+            if !final_view.is_synced || final_view.network_id != view.network_id
+                || final_view.virtual_daa_score < mature_daa
+                || !accepted_txids_at(&node, RpcHash::from_bytes(block), included).await
+                    .is_some_and(|ids| ids.contains(&accepted_txid)) {
+                return Err(err(StatusCode::SERVICE_UNAVAILABLE, "selected-chain view changed"));
+            }
+            record.phase = if matches!(record.phase, JournalPhase::Conflicted | JournalPhase::ConflictSettled) { JournalPhase::ConflictSettled } else { JournalPhase::Settled };
+            state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+                .update(&mut record).map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "journal unavailable"))?;
+        } else if was_terminal {
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "wallet settlement scan is incomplete"));
+        }
+    }
+    Ok(record)
+}
+
+/// True only for positive selected-chain replacement. Unavailable history
+/// leaves the exact persisted inclusion unchanged for a later retry.
+fn apply_inclusion_lookup(
+    record: &mut batch_journal::JournalRecord, lookup: AcceptanceLookup, expected_txid: [u8; 32],
+) -> Result<bool, ()> {
+    match lookup {
+        AcceptanceLookup::Found(ids) if ids.contains(&expected_txid) => Ok(false),
+        AcceptanceLookup::Replaced => { record.invalidate_chain_provenance(); Ok(true) }
+        AcceptanceLookup::Found(_) | AcceptanceLookup::Unavailable => Err(()),
+    }
+}
+
+fn release_depth_satisfied(included: u64, node_tip: u64, wallet_scanned: u64) -> bool {
+    included.checked_add(DEFAULT_ANCHOR_DEPTH)
+        .is_some_and(|mature| node_tip >= mature && wallet_scanned >= mature)
+}
+
+pub(super) async fn reconcile_wallet_journal(
+    state: &Arc<AppState>, wallet: &Wallet, fvk: &[u8; 96],
+) -> Result<(), BatchHttpError> {
+    let records = state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?
+        .records_for_fvk(fvk);
+    for record in records { reconcile_record(state, wallet, record).await?; }
+    Ok(())
 }
 
 #[derive(Clone, Deserialize)]
@@ -750,6 +1070,9 @@ pub(super) async fn issue_batch_capability(
     headers: HeaderMap,
     Json(req): Json<BatchGrantReq>,
 ) -> Result<Json<BatchGrantResp>, (StatusCode, Json<serde_json::Value>)> {
+    if !state.batch_journal_ready {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "payment journal migration is required"));
+    }
     if !supported_profile(state.allow_custodial, state.enable_multiparty, &state.network) {
         return Err(err(
             StatusCode::NOT_IMPLEMENTED,
@@ -771,6 +1094,8 @@ pub(super) async fn issue_batch_capability(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid logical id"))?
         .try_into()
         .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid logical id"))?;
+    let _journal_scope = state.journal_reconcile.lock().await;
+    reconcile_wallet_journal(&state, &wallet, &fvk).await?;
     let now = std::time::Instant::now();
     // Hold the legacy active tracker while examining unsigned legacy sessions and
     // installing the new reservation. A legacy prepare keeps its active marker
@@ -779,6 +1104,12 @@ pub(super) async fn issue_batch_capability(
     let pending = state.prepared.try_lock().map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "preparation tracker busy"))?;
     if legacy_reservation_exists(&fvk, &active, pending.values().map(|session| (session.fvk, session.created)), now) {
         return Err(err(StatusCode::CONFLICT, "this wallet already has a pending payment preparation"));
+    }
+    if state.batch_journal.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "journal unavailable"))?.reserves(&fvk) {
+        return Err(err(StatusCode::CONFLICT, "this wallet has an unresolved submitted payment"));
+    }
+    if state.submitting.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "submission tracker unavailable"))?.contains(&fvk) {
+        return Err(err(StatusCode::CONFLICT, "this wallet has a submission in progress"));
     }
     let mut registry =
         state.batch_preparations.lock().map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "batch tracker poisoned"))?;
@@ -1011,6 +1342,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unavailable_history_preserves_inclusion_for_node_recovery() {
+        let tx = payment_tx(vec![1]);
+        let mut record = batch_journal::JournalRecord::new(
+            [1; 96], "token", [7; 32], [8; 43], "legacy", [2; 32], [3; 32],
+            borsh::to_vec(&tx).unwrap(), vec![42],
+        ).unwrap();
+        record.phase = batch_journal::JournalPhase::Settled;
+        record.start_cursor = Some([4; 32]);
+        record.scan_cursor = Some([5; 32]);
+        record.included_block = Some([6; 32]);
+        record.included_daa = Some(100);
+        let original = record.clone();
+        assert!(apply_inclusion_lookup(&mut record, AcceptanceLookup::Unavailable, tx.id().as_bytes()).is_err());
+        assert_eq!(record, original);
+        assert_eq!(apply_inclusion_lookup(&mut record, AcceptanceLookup::Found(vec![tx.id().as_bytes()]), tx.id().as_bytes()), Ok(false));
+        assert_eq!(record, original);
+        assert_eq!(apply_inclusion_lookup(&mut record, AcceptanceLookup::Replaced, tx.id().as_bytes()), Ok(true));
+        assert_eq!(record.phase, batch_journal::JournalPhase::Unknown);
+        assert!(record.scan_cursor.is_none());
+    }
+
+    #[test]
+    fn release_requires_six_hundred_daa_on_node_and_wallet() {
+        assert!(!release_depth_satisfied(100, 699, 700));
+        assert!(!release_depth_satisfied(100, 700, 699));
+        assert!(release_depth_satisfied(100, 700, 700));
+        assert!(!release_depth_satisfied(u64::MAX, u64::MAX, u64::MAX));
+    }
+
+    #[test]
     fn profile_and_legacy_reservation_fail_closed() {
         assert!(supported_profile(false, false, "mainnet"));
         assert!(!supported_profile(true, false, "mainnet"));
@@ -1065,7 +1426,7 @@ mod tests {
 
     #[test]
     fn finalized_bytes_are_immutable_for_identical_retry() {
-        let first = BatchFinalized::new(vec![1, 2, 3], "abcd".into(), [7; 32], vec![(0, [1; 64])]);
+        let first = BatchFinalized::new(vec![1, 2, 3], "abcd".into(), [7; 32], vec![(0, [1; 64])], vec![1]);
         let first_json = serde_json::to_vec(&first.response).unwrap();
         assert_eq!(first.response.transaction_hex, "010203");
         assert_eq!(first.response.sha256, hex(&sha2::Sha256::digest([1, 2, 3])));
@@ -1191,7 +1552,7 @@ mod tests {
             .begin_finalize(&fvk_bytes, "owner", [1; 32], &hex(&[2; 24]), account, &genesis, &signatures, now)
             .unwrap()
         {
-            BatchFinalizeStart::New(prepared, intent) => (*prepared, intent),
+            BatchFinalizeStart::New(prepared, intent, _) => (*prepared, intent),
             _ => panic!("expected one finalization"),
         };
         let finalized = finalize_batch_prepared(prepared, intent, signatures.clone(), [1; 32], fvk_bytes, genesis, "simnet").unwrap();
